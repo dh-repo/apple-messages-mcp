@@ -2,7 +2,7 @@
 
 Local, read-mostly connector so a Cursor / Grok Bot agent can use **the user's real Messages.app data** on their Mac. No marketplace phone number. No cloud relay. The process reads `chat.db` on localhost and, only when explicitly enabled, asks Messages.app to send via AppleScript.
 
-**Default scope:** none. If the host does not set `MESSAGES_SCOPE_DISPLAY_NAME`, `MESSAGES_SCOPE_CHAT_ID`, or `MESSAGES_SCOPE_ALLOWLIST`, every readable chat is available. `messages_status.scope.note` says so explicitly. An allowlist is optional.
+**Default scope:** shut. If the host does not set `MESSAGES_SCOPE` and does not set `MESSAGES_ALLOW_UNSCOPED=1`, `list` / `search` / `get_thread` / `send` / `watch` return `SCOPE` and `scope.candidates` (group titles only). `messages_status.unscoped` is true only with the explicit flag. An allowlist filters *results*, not the bytes of the temp copy.
 
 Contacts names visible in Messages live in AddressBook, **not** in `chat.db`. Phase 1 returns phone/email handles and `chat.display_name` when Apple stored one. We do not open Contacts.
 
@@ -16,8 +16,9 @@ Cursor / Claude Desktop / Grok Bot
         ▼
 apple-messages-mcp (this repo, Node 22+)
         │
-        ├─ copy-on-read ─► temp chat.db + WAL/SHM ─► node:sqlite queries
-        │                                            (list / thread / search)
+        ├─ warm snapshot ─► one 0700 chat.db + WAL/SHM copy per process
+        │                    recopy on live db/wal mtime/size change
+        │                    (list / thread / search / watch share it)
         ├─ optional ─► osascript ─► Messages.app  (send only)
         └─ optional ─► `watch` process ─► JSON line / MESSAGES_WAKE_HOOK
 ```
@@ -26,16 +27,17 @@ apple-messages-mcp (this repo, Node 22+)
 - No HTTP server. No remote sync. No private Messages APIs. No GUI scrape. SIP stays on.
 - Default query engine is Node's built-in `node:sqlite` (`DatabaseSync`). That is a real SQLite, so a copied `chat.db` + `-wal` + `-shm` can replay the WAL. `sql.js` cannot apply WAL from a byte buffer, which would drop the newest messages while Messages.app is open. `better-sqlite3` would also work; we avoided a native addon because tests must run on a Linux CI VM.
 
-### Copy-on-read (default `MESSAGES_DB_MODE=copy`)
+### Warm snapshot (default `MESSAGES_DB_MODE=copy`)
 
 1. `access()` the live file. `EACCES` / `EPERM` → treat as **Full Disk Access missing**.
-2. Copy `chat.db`, `chat.db-wal`, and `chat.db-shm` (if present) into a `0700` directory under `$TMPDIR`.
-3. Open the copy read-write so SQLite can apply the WAL, then `PRAGMA query_only=ON`.
-4. Run the tool query. Close and `rm -rf` the temp dir.
+2. Keep **one** `0700` directory under `$TMPDIR` per process. Recopy only when live `chat.db` or `-wal` mtime/size changes.
+3. Copy order is best-effort against a writer: `-wal`, `chat.db`, `-wal` again, `-shm`. Then `PRAGMA integrity_check`. Retry a few times. This is still a race, not snapshot isolation.
+4. Open the copy so SQLite can apply the WAL, then `PRAGMA query_only=ON`. The watcher shares this snapshot.
+5. Unlink the directory on process exit / SIGTERM. Do not photocopy on every tool call.
 
-`MESSAGES_DB_MODE=direct` opens the live file read-only. Use it only if copy fails; Messages.app often holds a write lock and the snapshot can be stale.
+`MESSAGES_DB_MODE=direct` opens the live file read-only. Do not switch the default to `direct`; Messages.app often holds a write lock and the snapshot can be stale.
 
-**Honest limitation:** the temp copy is the *entire* database. An allowlist filters *results*, not the bytes on disk. The copy is mode `0700` and deleted when the tool call finishes.
+**Honest limitation:** the temp copy is the *entire* database. An allowlist filters *results*, not the bytes on disk. `messages_status` reports `temp_copy_bytes` and `snapshot_age_ms`.
 
 ---
 
@@ -55,7 +57,7 @@ SQLite. Path override: `MESSAGES_DB_PATH`. Schema drifts across macOS releases; 
 | `attachment` | Metadata only for Phase 1: `filename`, `mime_type`, `transfer_name`, `total_bytes`. Files sit under `~/Library/Messages/Attachments/`. |
 | `message_attachment_join` | `message_id` ↔ `attachment_id`. |
 
-**Text on modern macOS.** From about Sonoma onward, and almost always on Tahoe (macOS 26), `message.text` is empty and the body is only in `attributedBody`. We decode the first `NSString` payload after the `NSString` marker and `0x2B` length prefix. If both columns are empty, the row is attachment-only or a tapback.
+**Text on modern macOS.** From about Sonoma onward, and almost always on Tahoe (macOS 26), `message.text` is empty and the body is only in `attributedBody`. We decode the first `NSString` payload after the `NSString` marker and `0x2B` length prefix. If that fails and we fall back to printable bytes, `text_source` is `"guess"` so class-name junk is not silently “the body.” If both columns are empty, the row is attachment-only or a tapback.
 
 **Dates.** `datetime(date/1000000000 + 978307200, 'unixepoch')`. We also accept legacy second-resolution values by magnitude. Nanosecond values (~1e18) do not fit in a JavaScript number; every `date` column is `CAST(... AS TEXT)` and parsed as `BigInt`.
 
@@ -91,11 +93,11 @@ Arguments are passed as `argv` to `osascript` (no string interpolation into the 
 
 | Asset | Risk | Mitigation |
 | --- | --- | --- |
-| Entire `chat.db` | FDA + this process = every thread | Optional allowlist; default is unscoped (the host must opt in to restrict); do not add AddressBook in Phase 1 |
-| Temp copy | Full DB bytes in `$TMPDIR` for the duration of a tool call | `0700` dir, delete on exit, never upload |
+| Entire `chat.db` | FDA + this process = every thread | Default scoped shut; `MESSAGES_ALLOW_UNSCOPED=1` is the only whole-inbox switch; do not add AddressBook |
+| Temp copy | Full DB bytes in `$TMPDIR` for the process lifetime | One `0700` snapshot; recopy on wal/db change; unlink on exit; never upload |
 | Tool results | The MCP host (Cursor, Grok Bot) sees plaintext | Trust the host; optional `REDACT_PREVIEWS=1`; instructions say do not ship bodies off-box |
 | Logs | Accidental cloud log of SMS/iMessage | stderr events are counts / ids / error codes only |
-| Send | Agent sends a real text | Default off; tool text says confirm first; still scoped to the group |
+| Send | Agent sends a real text | Tool unregistered unless `ENABLE_SEND=1`; then `confirm: true` is required |
 | Network | None in Phase 1 | No telemetry, no HTTP |
 | TCC bypass | Tempting to attach to Messages or disable SIP | Out of scope. We fail closed and explain FDA / Automation |
 
@@ -129,7 +131,7 @@ All tools return a JSON text block. Errors are `{ "error": { "code", "message" }
 { "type": "object", "properties": {}, "additionalProperties": false }
 ```
 
-Reports `readable`, `fda_likely_missing`, `macos`, `send_enabled`, `unscoped`, and `scope`. When no scope env is set, `unscoped` is true and `scope.note` states that all readable chats are available. When an allowlist is set, `scope.chats` are the matches and `candidates` lists group titles if nothing matched. No message bodies.
+Reports `readable`, `fda_likely_missing`, `macos`, `send_enabled`, `unscoped`, `temp_copy_bytes`, `snapshot_age_ms`, and `scope`. `unscoped` is true only when `MESSAGES_ALLOW_UNSCOPED=1`. With empty `MESSAGES_SCOPE` and the flag unset, `scope.matched` is false and `candidates` lists group titles only. No message bodies.
 
 ### `messages_list_chats`
 
@@ -156,13 +158,15 @@ Recent chats by last message date. If an allowlist is set, only those chats.
     "handle": { "type": "string" },
     "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
     "before": { "type": ["integer", "string"] },
-    "include_reactions": { "type": "boolean" }
+    "include_reactions": { "type": "boolean" },
+    "from_date": { "type": "string" },
+    "to_date": { "type": "string" }
   },
   "additionalProperties": false
 }
 ```
 
-`chat_id` is `chat.ROWID`. `handle` is a phone/email (punctuation-tolerant). Omitted only works when the allowlist resolved to exactly one chat; unscoped calls must pass `chat_id` or `handle`. `before` is a `message_id` or ISO-8601 timestamp. Page is oldest-first.
+`chat_id` is `chat.ROWID` (a page number; it can move across restore). Prefer `guid` to remember a thread. `handle` is a phone/email (punctuation-tolerant) or a `guid`. Omitted only works when the allowlist resolved to exactly one chat; unscoped calls must pass `chat_id` or `handle`. `before` is a `message_id` or ISO-8601 timestamp. `from_date` / `to_date` filter on the converted Apple date. Page is oldest-first.
 
 ### `messages_search`
 
@@ -173,15 +177,17 @@ Recent chats by last message date. If an allowlist is set, only those chats.
   "properties": {
     "query": { "type": "string", "minLength": 1 },
     "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
-    "chat_id": { "type": "integer", "minimum": 1 }
+    "chat_id": { "type": "integer", "minimum": 1 },
+    "from_date": { "type": "string" },
+    "to_date": { "type": "string" }
   },
   "additionalProperties": false
 }
 ```
 
-Case-insensitive substring over `text` and decoded `attributedBody`. With no `chat_id`, searches all readable chats or the allowlist. Scans recent rows then filters in process so Tahoe blobs are included.
+Two-phase, no FTS in `chat.db`: SQL `LIKE` on the plain `text` column, then a bounded decode-scan of empty-`text` / Tahoe rows. Returns `truncated` and `scanned` when that window is exhausted. With no `chat_id`, searches all readable chats or the allowlist.
 
-### `messages_send` (registered, gated)
+### `messages_send` (unregistered unless armed)
 
 ```json
 {
@@ -189,13 +195,14 @@ Case-insensitive substring over `text` and decoded `attributedBody`. With no `ch
   "required": ["to", "body"],
   "properties": {
     "to": { "type": "string", "minLength": 1 },
-    "body": { "type": "string", "minLength": 1 }
+    "body": { "type": "string", "minLength": 1 },
+    "confirm": { "type": "boolean" }
   },
   "additionalProperties": false
 }
 ```
 
-Requires `ENABLE_SEND=1`. `to` is a display name, guid, `chat_id`, or (1:1) handle. An allowlist, if set, still applies. This sends a real message.
+Registered only when `ENABLE_SEND=1`. `confirm` must be `true` or the tool returns `INVALID_ARGS`. `to` is resolved in process to one in-scope chat (`guid` / handle / `chat_id` / display name), then passed to AppleScript as argv. This sends a real message.
 
 Error codes: `NOT_FOUND`, `PERMISSION`, `OPEN_FAILED`, `SCOPE`, `SEND_DISABLED`, `SEND_FAILED`, `INVALID_ARGS`, `UNSUPPORTED`.
 
@@ -225,12 +232,12 @@ MESSAGES_WAKE_HOOK=/ABS/PATH/TO/apple-messages-mcp/examples/wake-hook.sh \
 
 What it does:
 
-1. Resolves the optional allowlist. If none is set, watches every chat.
-2. Copy-on-read, then `MAX(message.ROWID)` for that `chat_id` only.
-3. Polls every `MESSAGES_WATCH_INTERVAL_MS` (default 3000). Also `fs.watch`s `chat.db` / `chat.db-wal` when present (disable with `MESSAGES_WATCH_FS=0`).
+1. Resolves `MESSAGES_SCOPE`. Empty scope + flag unset → `SCOPE`. `MESSAGES_ALLOW_UNSCOPED=1` watches every chat.
+2. Per-chat watermark: `Map<chat_id, last_rowid>`. Two chats moving in one tick emit two `messages.new` events. Still no bodies.
+3. Shares the process warm snapshot. Polls every `MESSAGES_WATCH_INTERVAL_MS` (default 3000). `fs.watch` sets `dirty`; the interval does not overwrite that when watch is on (`MESSAGES_WATCH_FS=0` falls back to interval-as-poll).
 4. Writes one JSON object per line to **stdout** of the watch process:
-   - `{"type":"messages.ready", "chat_id", "display_name", "newest_message_id", "newest_at"}`
-   - `{"type":"messages.new", "chat_id", "newest_message_id", "previous_message_id", "count_new", "newest_at", "preview"}`
+   - `{"type":"messages.ready", "chat_id", "guid", "chat_identifier", "display_name", "newest_message_id", "newest_at"}`
+   - `{"type":"messages.new", "chat_id", "guid", "chat_identifier", "newest_message_id", "previous_message_id", "count_new", "newest_at", "preview"}`
 5. If `MESSAGES_WAKE_HOOK` is set, also spawns that executable and writes the same JSON to its stdin (no shell).
 6. `preview` is omitted unless `--preview` / `WATCH_INCLUDE_PREVIEW=1`, and is **always redacted** (`[redacted N chars]`). The host should call `messages_get_thread` after a wake.
 
@@ -246,10 +253,9 @@ Stdio server. Cursor stores the same three fields the dialog asks for: `command`
 {
   "mcpServers": {
     "apple-messages": {
-      "command": "/usr/bin/npx",
+      "command": "node",
       "args": [
-        "tsx",
-        "/ABS/PATH/TO/apple-messages-mcp/src/index.ts"
+        "/ABS/PATH/TO/apple-messages-mcp/dist/index.js"
       ],
       "env": {
         "MESSAGES_DB_MODE": "copy",
@@ -261,16 +267,12 @@ Stdio server. Cursor stores the same three fields the dialog asks for: `command`
 }
 ```
 
-If `npx` is not on Cursor's PATH, set `command` to the repo's `node_modules/.bin/tsx` and `args` to `[ "<repo>/src/index.ts" ]`.
-
-To optionally restrict the agent, add any of `MESSAGES_SCOPE_DISPLAY_NAME`, `MESSAGES_SCOPE_CHAT_ID`, or `MESSAGES_SCOPE_ALLOWLIST` to `env`. None of those are required.
+Dev: `npx tsx src/index.ts`. A personal Grok Bot that wants the whole inbox sets `MESSAGES_ALLOW_UNSCOPED=1`. A family/work box sets `MESSAGES_SCOPE`.
 
 | Env | Default | Meaning |
 | --- | --- | --- |
-| `MESSAGES_SCOPE_DISPLAY_NAME` | unset | Optional single display-name allowlist entry |
-| `MESSAGES_SCOPE_CHAT_ID` | unset | Optional `chat.ROWID` allowlist entry |
-| `MESSAGES_SCOPE_ALLOWLIST` | unset | Comma/semicolon list of display names and/or `chat_id`s |
-| `MESSAGES_ALLOW_UNSCOPED` | `0` | `1` ignores scope env and exposes every thread |
+| `MESSAGES_SCOPE` | unset | Comma/semicolon tokens: display name, `chat_id`, `guid`, handle |
+| `MESSAGES_ALLOW_UNSCOPED` | `0` | `1` is the only way to open the whole inbox |
 | `MESSAGES_DB_PATH` | `~/Library/Messages/chat.db` | Fixture or alt home |
 | `MESSAGES_DB_MODE` | `copy` | `direct` skips the temp copy |
 | `ENABLE_SEND` | `0` | `1` allows `messages_send` |
@@ -289,29 +291,28 @@ Claude Desktop uses the same `mcpServers` object in `claude_desktop_config.json`
 Paste this into the agent's MCP / project instructions (not into a remote prompt that will be logged with message bodies):
 
 ```
-You have a local Apple Messages MCP. By default it is unscoped: every
-readable chat on this Mac is available. messages_status.unscoped will
-be true and scope.note will say so.
+You have a local Apple Messages MCP. By default it is scoped shut.
+messages_status.unscoped is true only if MESSAGES_ALLOW_UNSCOPED=1.
 
 Rules:
 - Call messages_status before diagnosing failures. If fda_likely_missing
   is true, tell the user to grant Full Disk Access to Cursor and restart.
-- Pass chat_id (chat.ROWID) or handle when calling messages_get_thread.
-  Do not guess a default group. messages_search without chat_id searches
-  across chats (or the optional allowlist).
-- If the host set MESSAGES_SCOPE_DISPLAY_NAME / MESSAGES_SCOPE_CHAT_ID /
-  MESSAGES_SCOPE_ALLOWLIST, stay inside that allowlist. If it matches
-  nothing, read scope.candidates (group titles only) and ask the user
-  to correct the env.
+- Pass chat_id (chat.ROWID), guid, or handle when calling
+  messages_get_thread. Prefer guid to remember a thread across launches.
+  Do not guess a default group.
+- If list/search/thread returns SCOPE, read scope.candidates (group
+  titles only) and ask the user to set MESSAGES_SCOPE or
+  MESSAGES_ALLOW_UNSCOPED=1. Stay inside the allowlist.
 - Handles are phone numbers and emails, not Contacts names. Do not invent
   surnames. chat_id is chat.ROWID; message_id is message.ROWID.
 - Never paste full threads into tickets, emails, or other MCP servers.
   Summarize. If REDACT_PREVIEWS=1, you will only see length placeholders.
-- messages_send is off unless ENABLE_SEND=1. Even then, confirm the exact
-  recipient and body with the user before sending.
-- There is no live push inside MCP. A separate `npx tsx src/index.ts watch`
-  process emits JSON-line wakes. After a wake, call messages_get_thread.
-  Do not treat the watcher as a chat channel.
+- messages_send is not registered unless ENABLE_SEND=1. When it is,
+  require confirm: true after the user accepted the exact recipient and
+  body. Do not send without that.
+- There is no live push inside MCP. A separate watch process emits
+  JSON-line wakes (one messages.new per chat that moved). After a wake,
+  call messages_get_thread. Do not treat the watcher as a chat channel.
 ```
 
 ---

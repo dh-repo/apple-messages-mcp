@@ -25,11 +25,9 @@ export type Config = {
   dbMode: DbMode;
   enableSend: boolean;
   redactPreviews: boolean;
-  scopeDisplayName: string | null;
-  scopeChatId: number | null;
-  /** Extra display names and/or chat.ROWID tokens from MESSAGES_SCOPE_ALLOWLIST. */
-  scopeAllowlist: string[];
-  /** When true, ignore any scope env and expose every readable chat. */
+  /** Tokens from MESSAGES_SCOPE: display name, chat_id, guid, handle. */
+  scope: string[];
+  /** Only `MESSAGES_ALLOW_UNSCOPED=1` opens the whole inbox. */
   allowUnscoped: boolean;
 };
 
@@ -62,7 +60,7 @@ export type AttachmentMeta = {
   total_bytes: number | null;
 };
 
-export type TextSource = "text" | "attributedBody" | "none";
+export type TextSource = "text" | "attributedBody" | "guess" | "none";
 
 export type MessageRow = {
   message_id: number;
@@ -79,6 +77,12 @@ export type MessageRow = {
   attachments: AttachmentMeta[];
 };
 
+export type SearchResult = {
+  messages: MessageRow[];
+  truncated: boolean;
+  scanned: number;
+};
+
 export type ScopeMatch = {
   active: boolean;
   mode: "unscoped" | "allowlist";
@@ -90,7 +94,7 @@ export type ScopeMatch = {
   /** First allowlist match; null when unscoped or nothing matched. */
   chat: ChatSummary | null;
   chats: ChatSummary[];
-  /** Group chats (display_name set) when an allowlist was set but nothing matched. */
+  /** Group titles only when an allowlist was set but nothing matched. */
   candidates: Array<{ chat_id: number; display_name: string }>;
 };
 
@@ -110,6 +114,8 @@ export type StatusReport = {
   allow_unscoped: boolean;
   unscoped: boolean;
   scope: ScopeMatch;
+  temp_copy_bytes: number | null;
+  snapshot_age_ms: number | null;
   schema: {
     tables: string[];
     has_attributed_body: boolean;

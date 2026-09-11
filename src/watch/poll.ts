@@ -5,8 +5,8 @@ import { MessagesError } from "../types.ts";
 import { withChatDb } from "../db/open.ts";
 import { isScopeActive } from "../config.ts";
 import {
-  countMessagesAfter,
-  getChatWatermark,
+  countMessagesAfterInChat,
+  getChatWatermarks,
   getThread,
   resolveScope,
 } from "../db/queries.ts";
@@ -17,6 +17,8 @@ export type WakeEvent =
   | {
       type: "messages.ready";
       chat_id: number;
+      guid: string | null;
+      chat_identifier: string | null;
       display_name: string | null;
       newest_message_id: number | null;
       newest_at: string | null;
@@ -24,6 +26,8 @@ export type WakeEvent =
   | {
       type: "messages.new";
       chat_id: number;
+      guid: string | null;
+      chat_identifier: string | null;
       display_name: string | null;
       newest_message_id: number;
       previous_message_id: number | null;
@@ -38,9 +42,7 @@ export type WakeEvent =
     };
 
 export type WatcherState = {
-  chatId: number | null;
-  displayName: string | null;
-  lastId: number | null;
+  watermarks: Record<number, number>;
   ready: boolean;
 };
 
@@ -49,7 +51,7 @@ export type WatchOptions = {
 };
 
 export function emptyWatcherState(): WatcherState {
-  return { chatId: null, displayName: null, lastId: null, ready: false };
+  return { watermarks: {}, ready: false };
 }
 
 export function pollOnce(
@@ -76,64 +78,69 @@ export function pollOnce(
       const chatIds = isScopeActive(config)
         ? scope.chats.map((chat) => chat.chat_id)
         : null;
-      const mark = getChatWatermark(db, chatIds);
-      const displayName =
-        chatIds && chatIds.length === 1 ? (scope.chat?.display_name ?? null) : null;
-      const next: WatcherState = {
-        chatId: mark.chat_id || scope.chat?.chat_id || null,
-        displayName,
-        lastId: mark.newest_message_id,
-        ready: true,
-      };
+      const marks = getChatWatermarks(db, chatIds);
+      const nextWatermarks: Record<number, number> = {};
+      for (const mark of marks) {
+        nextWatermarks[mark.chat_id] = mark.newest_message_id;
+      }
+      const next: WatcherState = { watermarks: nextWatermarks, ready: true };
 
       if (!state.ready) {
+        const primary =
+          chatIds && chatIds.length === 1
+            ? marks.find((mark) => mark.chat_id === chatIds[0]) ?? marks[0]
+            : marks.reduce<(typeof marks)[number] | undefined>(
+                (best, mark) =>
+                  !best || mark.newest_message_id > best.newest_message_id ? mark : best,
+                undefined,
+              );
         return {
           state: next,
           events: [
             {
               type: "messages.ready",
-              chat_id: next.chatId ?? 0,
-              display_name: displayName,
-              newest_message_id: mark.newest_message_id,
-              newest_at: mark.newest_at,
+              chat_id: primary?.chat_id ?? 0,
+              guid: primary?.guid ?? null,
+              chat_identifier: primary?.chat_identifier ?? null,
+              display_name:
+                chatIds && chatIds.length === 1 ? (primary?.display_name ?? null) : null,
+              newest_message_id: primary?.newest_message_id ?? null,
+              newest_at: primary?.newest_at ?? null,
             },
           ],
         };
       }
 
-      const previous = state.lastId ?? 0;
-      const current = mark.newest_message_id ?? 0;
-      if (current <= previous) {
-        return { state: next, events: [] };
-      }
+      const events: WakeEvent[] = [];
+      for (const mark of marks) {
+        const previous = state.watermarks[mark.chat_id] ?? 0;
+        if (mark.newest_message_id <= previous) continue;
 
-      let preview: string | null = null;
-      if (options.includePreview) {
-        const newest = getThread(db, {
-          chatId: next.chatId ?? mark.chat_id,
-          limit: 1,
-          redact: false,
+        let preview: string | null = null;
+        if (options.includePreview) {
+          const newest = getThread(db, {
+            chatId: mark.chat_id,
+            limit: 1,
+            redact: false,
+          });
+          preview = maybeRedact(newest[0]?.text ?? "", true);
+        }
+
+        events.push({
+          type: "messages.new",
+          chat_id: mark.chat_id,
+          guid: mark.guid,
+          chat_identifier: mark.chat_identifier,
+          display_name: mark.display_name,
+          newest_message_id: mark.newest_message_id,
+          previous_message_id: previous || null,
+          count_new: countMessagesAfterInChat(db, mark.chat_id, previous),
+          newest_at: mark.newest_at,
+          preview,
         });
-        const text = newest[0]?.text ?? "";
-        // Wake events never carry plaintext. Host should call messages_get_thread.
-        preview = maybeRedact(text, true);
       }
 
-      return {
-        state: next,
-        events: [
-          {
-            type: "messages.new",
-            chat_id: next.chatId ?? mark.chat_id,
-            display_name: displayName,
-            newest_message_id: current,
-            previous_message_id: state.lastId,
-            count_new: countMessagesAfter(db, chatIds, previous),
-            newest_at: mark.newest_at,
-            preview,
-          },
-        ],
-      };
+      return { state: next, events };
     });
   } catch (err) {
     if (err instanceof MessagesError) {
@@ -224,7 +231,7 @@ export async function runWatcher(args: RunWatcherArgs): Promise<void> {
           }),
         );
       } catch {
-        /* fs.watch is optional; interval still polls */
+        /* fs.watch is optional; interval still polls when useFsWatch is off */
       }
     }
   }
@@ -233,7 +240,7 @@ export async function runWatcher(args: RunWatcherArgs): Promise<void> {
   tick();
 
   const timer = setInterval(() => {
-    dirty = true;
+    if (!args.useFsWatch) dirty = true;
     tick();
   }, args.intervalMs);
 

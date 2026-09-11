@@ -1,4 +1,4 @@
-import type { ChatSummary, Config, MessageRow, StatusReport } from "./types.ts";
+import type { ChatSummary, Config, MessageRow, SearchResult, StatusReport } from "./types.ts";
 import { MessagesError } from "./types.ts";
 import { isScopeActive } from "./config.ts";
 import { withChatDb } from "./db/open.ts";
@@ -16,6 +16,16 @@ import { looksLikeHandle } from "./db/handles.ts";
 import { sendViaAppleScript } from "./send/applescript.ts";
 import { getStatus } from "./status.ts";
 
+function throwIfUnmatchedScope(scope: ReturnType<typeof resolveScope>): void {
+  if (!scope.active || scope.matched) return;
+  throw new MessagesError(
+    "SCOPE",
+    `Allowlist ${scope.allowlist.join(", ") || "(empty)"} matched no chats. Group name candidates: ${scope.candidates
+      .map((c) => `${c.chat_id}:${c.display_name}`)
+      .join("; ") || "(none)"}`,
+  );
+}
+
 export function actionStatus(config: Config): StatusReport {
   return getStatus(config);
 }
@@ -31,21 +41,12 @@ export function actionListChats(
   return withChatDb(config.dbPath, config.dbMode, (db) => {
     const scope = resolveScope(db, config);
     if (isScopeActive(config)) {
-      if (!scope.matched) {
-        return {
-          scope,
-          chats: [],
-          hint: `Allowlist ${scope.allowlist.join(", ") || "(empty)"} matched no chats. Use messages_status.scope.candidates to pick a display_name or chat_id.`,
-        };
-      }
-      const chats = scope.chats.filter((chat) => {
-        if (!args.query) return true;
-        const q = args.query.toLowerCase();
-        return (
-          chat.display_name?.toLowerCase().includes(q) ||
-          chat.chat_identifier?.toLowerCase().includes(q) ||
-          chat.handles.some((h) => h.id.toLowerCase().includes(q))
-        );
+      throwIfUnmatchedScope(scope);
+      const chats = listChats(db, {
+        limit: args.limit,
+        query: args.query,
+        redact: config.redactPreviews,
+        chatIds: scope.chats.map((chat) => chat.chat_id),
       });
       return { scope, chats };
     }
@@ -68,6 +69,8 @@ export function actionGetThread(
     limit?: number;
     before?: string | number;
     include_reactions?: boolean;
+    from_date?: string;
+    to_date?: string;
   },
 ): { chat: ChatSummary; messages: MessageRow[] } {
   return withChatDb(config.dbPath, config.dbMode, (db) => {
@@ -81,6 +84,8 @@ export function actionGetThread(
       before: args.before,
       redact: config.redactPreviews,
       includeReactions: args.include_reactions,
+      fromDate: args.from_date,
+      toDate: args.to_date,
     });
     return { chat, messages };
   });
@@ -88,8 +93,15 @@ export function actionGetThread(
 
 export function actionSearch(
   config: Config,
-  args: { query: string; limit?: number; chat_id?: number },
-): { chat_id: number | null; chat_ids: number[] | null; query: string; messages: MessageRow[] } {
+  args: { query: string; limit?: number; chat_id?: number; from_date?: string; to_date?: string },
+): {
+  chat_id: number | null;
+  chat_ids: number[] | null;
+  query: string;
+  messages: MessageRow[];
+  truncated: boolean;
+  scanned: number;
+} {
   return withChatDb(config.dbPath, config.dbMode, (db) => {
     const scope = resolveScope(db, config);
     let chatId = args.chat_id;
@@ -101,44 +113,57 @@ export function actionSearch(
       }
       assertChatAllowed(config, scope, chat);
     } else if (isScopeActive(config)) {
-      if (!scope.matched) {
-        throw new MessagesError(
-          "SCOPE",
-          `Allowlist ${scope.allowlist.join(", ") || "(empty)"} matched no chats.`,
-        );
-      }
+      throwIfUnmatchedScope(scope);
       if (scope.chats.length === 1) {
         chatId = scope.chats[0]?.chat_id;
       } else {
         chatIds = scope.chats.map((chat) => chat.chat_id);
       }
     }
-    const messages = searchMessages(db, {
+    const result: SearchResult = searchMessages(db, {
       query: args.query,
       chatId,
       chatIds,
       limit: args.limit,
       redact: config.redactPreviews,
+      fromDate: args.from_date,
+      toDate: args.to_date,
     });
     return {
       chat_id: chatId ?? null,
       chat_ids: chatIds ?? (chatId !== undefined ? [chatId] : null),
       query: args.query,
-      messages,
+      messages: result.messages,
+      truncated: result.truncated,
+      scanned: result.scanned,
     };
   });
 }
 
 export async function actionSend(
   config: Config,
-  args: { to: string; body: string },
+  args: { to: string; body: string; confirm?: boolean },
 ): Promise<{
   ok: true;
   via: string;
   to: string;
   chat_id: number;
+  guid: string;
   note: string;
 }> {
+  if (!config.enableSend) {
+    throw new MessagesError(
+      "SEND_DISABLED",
+      "messages_send is disabled. Set ENABLE_SEND=1 only after you accept that the agent can send real iMessages.",
+    );
+  }
+  if (args.confirm !== true) {
+    throw new MessagesError(
+      "INVALID_ARGS",
+      "messages_send requires confirm: true after the user accepted the exact recipient and body.",
+    );
+  }
+
   const chat = withChatDb(config.dbPath, config.dbMode, (db) => {
     if (looksLikeHandle(args.to)) {
       return resolveRequestedChat(db, config, { handle: args.to }).chat;
@@ -155,6 +180,7 @@ export async function actionSend(
   return {
     ...sent,
     chat_id: chat.chat_id,
+    guid: chat.guid,
     note: "Sent via Messages.app. Delivery depends on Apple's service, not this connector.",
   };
 }
