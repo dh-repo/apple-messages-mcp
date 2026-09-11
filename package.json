@@ -1,0 +1,52 @@
+{
+  "name": "apple-messages-mcp",
+  "version": "0.1.0",
+  "description": "Local MCP server that reads (and optionally sends) Apple Messages / iMessage via chat.db",
+  "type": "module",
+  "main": "src/index.ts",
+  "bin": {
+    "apple-messages-mcp": "src/index.ts"
+  },
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "watch": "tsx src/index.ts watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "mcp",
+    "imessage",
+    "messages",
+    "macos"
+  ],
+  "license": "MIT",
+  "files": [
+    "src",
+    "examples",
+    "DESIGN.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dh-repo/apple-messages-mcp.git"
+  },
+  "homepage": "https://github.com/dh-repo/apple-messages-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/dh-repo/apple-messages-mcp/issues"
+  }
+}

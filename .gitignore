@@ -1,0 +1,16 @@
+node_modules/
+dist/
+coverage/
+.tmp-chat-db/
+.env
+*.log
+.DS_Store
+agent-tools/
+assets/
+*.db
+*.db-wal
+*.db-shm
+mcp.json
+.env.*
+*.pem
+*.key

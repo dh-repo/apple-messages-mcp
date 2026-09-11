@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "apple-messages": {
+      "command": "/usr/bin/npx",
+      "args": ["tsx", "/ABS/PATH/TO/apple-messages-mcp/src/index.ts"],
+      "env": {
+        "MESSAGES_DB_MODE": "copy",
+        "ENABLE_SEND": "0",
+        "REDACT_PREVIEWS": "0"
+      }
+    }
+  }
+}
