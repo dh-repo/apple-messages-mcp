@@ -118,5 +118,19 @@ describe("MCP protocol", () => {
       }),
     ) as { error?: { code: string } };
     expect(send.error?.code).toBe("INVALID_ARGS");
+
+    const preview = parseContent(
+      await client.callTool({
+        name: "messages_send",
+        arguments: { to: GROUP_NAME, body: "hi", dry_run: true },
+      }),
+    ) as { to: string; chat_id: number; guid: string; body: string; via?: string };
+    expect(preview).toEqual({
+      to: GROUP_NAME,
+      chat_id: group!.chat_id,
+      guid: group!.guid,
+      body: "hi",
+    });
+    expect(preview.via).toBeUndefined();
   });
 });

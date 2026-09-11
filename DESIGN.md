@@ -14,11 +14,14 @@ Contacts names visible in Messages live in AddressBook, **not** in `chat.db`. Ph
 Cursor / Claude Desktop / Grok Bot
         │  stdio JSON-RPC (MCP)
         ▼
-apple-messages-mcp (this repo, Node 22+)
+apple-messages-mcp (this repo, Node 22)
         │
         ├─ warm snapshot ─► one 0700 chat.db + WAL/SHM copy per process
         │                    recopy on live db/wal mtime/size change
         │                    (list / thread / search / watch share it)
+        ├─ decode sidecar ─► our file of (message_id, decoded_text)
+        │                    invalidate when live MAX(ROWID) moves
+        │                    never written into Apple's chat.db
         ├─ optional ─► osascript ─► Messages.app  (send only)
         └─ optional ─► `watch` process ─► JSON line / MESSAGES_WAKE_HOOK
 ```
@@ -95,6 +98,7 @@ Arguments are passed as `argv` to `osascript` (no string interpolation into the 
 | --- | --- | --- |
 | Entire `chat.db` | FDA + this process = every thread | Default scoped shut; `MESSAGES_ALLOW_UNSCOPED=1` is the only whole-inbox switch; do not add AddressBook |
 | Temp copy | Full DB bytes in `$TMPDIR` for the process lifetime | One `0700` snapshot; recopy on wal/db change; unlink on exit; never upload |
+| Decode sidecar | Decoded Tahoe bodies in `$TMPDIR` | Our file only `(message_id, decoded_text)`; invalidate on live `MAX(ROWID)`; unlink on exit; never write into `chat.db` |
 | Tool results | The MCP host (Cursor, Grok Bot) sees plaintext | Trust the host; optional `REDACT_PREVIEWS=1`; instructions say do not ship bodies off-box |
 | Logs | Accidental cloud log of SMS/iMessage | stderr events are counts / ids / error codes only |
 | Send | Agent sends a real text | Tool unregistered unless `ENABLE_SEND=1`; then `confirm: true` is required |
@@ -185,7 +189,7 @@ Recent chats by last message date. If an allowlist is set, only those chats.
 }
 ```
 
-Two-phase, no FTS in `chat.db`: SQL `LIKE` on the plain `text` column, then a bounded decode-scan of empty-`text` / Tahoe rows. Returns `truncated` and `scanned` when that window is exhausted. With no `chat_id`, searches all readable chats or the allowlist.
+Two-phase, no FTS in `chat.db` and no FTS on `attributedBody`: SQL `LIKE` on the plain `text` column, then a bounded decode-scan of empty-`text` / Tahoe rows. Decoded Tahoe bodies are stored in a sidecar file **we own** — `(message_id, decoded_text)` only. The sidecar is valid for the live `MAX(ROWID)`: a rising MAX keeps old decodes (so blobs stay findable after they leave the scan window) and requires ingesting the new window; a falling MAX wipes it. Search uses the sidecar. `truncated` is true when an in-scope empty-`text` row has not been decoded yet. We never `CREATE` / `INSERT` into Apple's `chat.db`.
 
 ### `messages_send` (unregistered unless armed)
 
@@ -196,13 +200,14 @@ Two-phase, no FTS in `chat.db`: SQL `LIKE` on the plain `text` column, then a bo
   "properties": {
     "to": { "type": "string", "minLength": 1 },
     "body": { "type": "string", "minLength": 1 },
-    "confirm": { "type": "boolean" }
+    "confirm": { "type": "boolean" },
+    "dry_run": { "type": "boolean" }
   },
   "additionalProperties": false
 }
 ```
 
-Registered only when `ENABLE_SEND=1`. `confirm` must be `true` or the tool returns `INVALID_ARGS`. `to` is resolved in process to one in-scope chat (`guid` / handle / `chat_id` / display name), then passed to AppleScript as argv. This sends a real message.
+Registered only when `ENABLE_SEND=1`. `dry_run: true` resolves `to` and returns `{ to, chat_id, guid, body }` without calling `osascript`. A real send still requires `confirm: true` or the tool returns `INVALID_ARGS`. `to` is resolved in process to one in-scope chat (`guid` / handle / `chat_id` / display name), then passed to AppleScript as argv. No confirm-token / TTL product.
 
 Error codes: `NOT_FOUND`, `PERMISSION`, `OPEN_FAILED`, `SCOPE`, `SEND_DISABLED`, `SEND_FAILED`, `INVALID_ARGS`, `UNSUPPORTED`.
 
@@ -308,8 +313,9 @@ Rules:
 - Never paste full threads into tickets, emails, or other MCP servers.
   Summarize. If REDACT_PREVIEWS=1, you will only see length placeholders.
 - messages_send is not registered unless ENABLE_SEND=1. When it is,
-  require confirm: true after the user accepted the exact recipient and
-  body. Do not send without that.
+  dry_run: true previews { to, chat_id, guid, body } without sending.
+  A real send still requires confirm: true after the user accepted the
+  exact recipient and body. Do not send without that.
 - There is no live push inside MCP. A separate watch process emits
   JSON-line wakes (one messages.new per chat that moved). After a wake,
   call messages_get_thread. Do not treat the watcher as a chat channel.
