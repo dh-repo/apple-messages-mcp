@@ -37,12 +37,12 @@ function usage(): string {
   list [--query TEXT]    messages_list_chats
   thread [--chat-id N] [--handle ADDR] [--limit N] [--before ID|ISO]
   search QUERY
-  send --to NAME --body TEXT   (needs ENABLE_SEND=1)
+  send --to NAME --body TEXT --confirm   (needs ENABLE_SEND=1)
   watch [--interval MS]  Phase 2 JSON-line wake hook (not MCP)
 
 Env: MESSAGES_DB_PATH, ENABLE_SEND, REDACT_PREVIEWS,
-     optional MESSAGES_SCOPE_DISPLAY_NAME / MESSAGES_SCOPE_CHAT_ID /
-     MESSAGES_SCOPE_ALLOWLIST, MESSAGES_WAKE_HOOK, WATCH_INCLUDE_PREVIEW
+     MESSAGES_SCOPE, MESSAGES_ALLOW_UNSCOPED,
+     MESSAGES_WAKE_HOOK, WATCH_INCLUDE_PREVIEW
 `;
 }
 
@@ -107,6 +107,8 @@ export async function runCli(argv: string[]): Promise<void> {
             handle,
             limit: limit ? Number(limit) : undefined,
             before: before && /^-?\d+$/.test(before) ? Number(before) : before,
+            from_date: flag(argv, "--from"),
+            to_date: flag(argv, "--to"),
           }),
         );
         return;
@@ -123,7 +125,9 @@ export async function runCli(argv: string[]): Promise<void> {
         if (!to || !body) {
           throw new MessagesError("INVALID_ARGS", "send requires --to and --body.");
         }
-        printJson(await actionSend(config, { to, body }));
+        printJson(
+          await actionSend(config, { to, body, confirm: argv.includes("--confirm") }),
+        );
         return;
       }
       case "watch": {

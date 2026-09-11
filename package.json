@@ -3,11 +3,12 @@
   "version": "0.1.0",
   "description": "Local MCP server that reads (and optionally sends) Apple Messages / iMessage via chat.db",
   "type": "module",
-  "main": "src/index.ts",
+  "main": "dist/index.js",
   "bin": {
-    "apple-messages-mcp": "src/index.ts"
+    "apple-messages-mcp": "dist/index.js"
   },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
     "start": "tsx src/index.ts",
     "watch": "tsx src/index.ts watch",
     "test": "vitest run",
@@ -25,6 +26,7 @@
   ],
   "license": "MIT",
   "files": [
+    "dist",
     "src",
     "examples",
     "DESIGN.md",

@@ -15,6 +15,7 @@ import {
   GROUP_NAME,
   makeConfig,
   makeScopedConfig,
+  makeUnscopedConfig,
 } from "./helpers/fixture.ts";
 
 const fixtures: Array<{ cleanup: () => void }> = [];
@@ -41,12 +42,22 @@ describe("scoped queries", () => {
     db.close();
   });
 
-  it("is unscoped when no MESSAGES_SCOPE_* is set", () => {
+  it("is scoped shut when no MESSAGES_SCOPE and ALLOW_UNSCOPED is unset", () => {
     const { db } = openFixture();
     const scope = resolveScope(db, makeConfig({ dbPath: ":memory:" }));
+    expect(scope.active).toBe(true);
+    expect(scope.mode).toBe("allowlist");
+    expect(scope.matched).toBe(false);
+    expect(scope.note).toMatch(/return SCOPE/);
+    expect(scope.candidates.some((c) => c.display_name === GROUP_NAME)).toBe(true);
+    db.close();
+  });
+
+  it("is unscoped only when MESSAGES_ALLOW_UNSCOPED is set", () => {
+    const { db } = openFixture();
+    const scope = resolveScope(db, makeUnscopedConfig({ dbPath: ":memory:" }));
     expect(scope.active).toBe(false);
     expect(scope.mode).toBe("unscoped");
-    expect(scope.note).toMatch(/All readable chats are available/);
     expect(scope.matched).toBe(true);
     db.close();
   });
@@ -62,11 +73,11 @@ describe("scoped queries", () => {
     db.close();
   });
 
-  it("resolves MESSAGES_SCOPE_ALLOWLIST tokens", () => {
+  it("resolves MESSAGES_SCOPE tokens", () => {
     const { db, ids } = openFixture();
     const scope = resolveScope(
       db,
-      makeConfig({ dbPath: ":memory:", scopeAllowlist: [String(ids.groupChatId)] }),
+      makeConfig({ dbPath: ":memory:", scope: [String(ids.groupChatId)] }),
     );
     expect(scope.chats.map((c) => c.chat_id)).toEqual([ids.groupChatId]);
     db.close();
@@ -97,6 +108,18 @@ describe("scoped queries", () => {
     db.close();
   });
 
+  it("filters get_thread with from_date / to_date", () => {
+    const { db, ids } = openFixture();
+    const page = getThread(db, {
+      chatId: ids.groupChatId,
+      fromDate: "2026-03-01T18:01:30Z",
+      toDate: "2026-03-01T18:02:30Z",
+      redact: false,
+    });
+    expect(page.map((m) => m.text)).toEqual(["Tahoe-only body: meet at 7."]);
+    db.close();
+  });
+
   it("paginates with before=message_id", () => {
     const { db, ids } = openFixture();
     const page = getThread(db, {
@@ -117,18 +140,18 @@ describe("scoped queries", () => {
       chatId: ids.groupChatId,
       redact: false,
     });
-    expect(hits).toHaveLength(1);
-    expect(hits[0]?.text).toContain("meet at 7");
+    expect(hits.messages).toHaveLength(1);
+    expect(hits.messages[0]?.text).toContain("meet at 7");
 
     const decoyHits = searchMessages(db, {
       query: "SECRET",
       chatId: ids.groupChatId,
       redact: false,
     });
-    expect(decoyHits).toHaveLength(0);
+    expect(decoyHits.messages).toHaveLength(0);
 
     const across = searchMessages(db, { query: "SECRET", redact: false });
-    expect(across.some((m) => m.text.includes("SECRET"))).toBe(true);
+    expect(across.messages.some((m) => m.text.includes("SECRET"))).toBe(true);
     db.close();
   });
 
@@ -155,14 +178,14 @@ describe("scoped queries", () => {
   it("get_thread without args refuses to guess when unscoped", () => {
     const { db } = openFixture();
     expect(() =>
-      resolveRequestedChat(db, makeConfig({ dbPath: ":memory:" }), {}),
+      resolveRequestedChat(db, makeUnscopedConfig({ dbPath: ":memory:" }), {}),
     ).toThrow(/unscoped/);
     db.close();
   });
 
   it("matches a participant handle with extra punctuation", () => {
     const { db, ids } = openFixture();
-    const { chat } = resolveRequestedChat(db, makeConfig({ dbPath: ":memory:" }), {
+    const { chat } = resolveRequestedChat(db, makeUnscopedConfig({ dbPath: ":memory:" }), {
       handle: "+1 (555) 100-1001",
     });
     expect(chat.chat_id).toBe(ids.groupChatId);

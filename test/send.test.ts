@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { actionSend } from "../src/actions.ts";
 import { sendViaAppleScript } from "../src/send/applescript.ts";
 import { MessagesError } from "../src/types.ts";
 import { GROUP_NAME, makeConfig } from "./helpers/fixture.ts";
@@ -28,6 +29,15 @@ describe("messages_send gate", () => {
         config: makeConfig({ dbPath: ":memory:", enableSend: false }),
       }),
     ).rejects.toMatchObject({ code: "SEND_DISABLED" } satisfies Partial<MessagesError>);
+  });
+
+  it("refuses send without confirm: true", async () => {
+    await expect(
+      actionSend(makeConfig({ dbPath: ":memory:", enableSend: true }), {
+        to: GROUP_NAME,
+        body: "hello",
+      }),
+    ).rejects.toMatchObject({ code: "INVALID_ARGS" } satisfies Partial<MessagesError>);
   });
 
   it("does not call osascript on non-macOS even when enabled", async () => {

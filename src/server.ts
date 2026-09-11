@@ -14,10 +14,10 @@ export function createServer(config: Config = loadConfig()): McpServer {
     description: [
       "Local Apple Messages / iMessage connector. All reads stay on this Mac.",
       isScopeActive(config)
-        ? `Optional allowlist is active (${[config.scopeDisplayName, config.scopeChatId, ...config.scopeAllowlist]
-            .filter((v) => v !== null && v !== "")
-            .join(", ")}).`
-        : "Unscoped: every readable chat is available unless the host sets MESSAGES_SCOPE_*.",
+        ? config.scope.length > 0
+          ? `MESSAGES_SCOPE is active (${config.scope.join(", ")}).`
+          : "Scoped shut: set MESSAGES_SCOPE or MESSAGES_ALLOW_UNSCOPED=1."
+        : "MESSAGES_ALLOW_UNSCOPED=1: every readable chat is available.",
       "Call messages_status first if a tool fails.",
       "Do not echo full threads into logs or remote systems.",
       config.enableSend

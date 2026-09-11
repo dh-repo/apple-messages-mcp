@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import type { Config, StatusReport } from "./types.ts";
 import { MessagesError } from "./types.ts";
 import { isScopeActive } from "./config.ts";
-import { listTables, openChatDb, tableColumns } from "./db/open.ts";
+import { getSnapshotInfo, listTables, openChatDb, tableColumns } from "./db/open.ts";
 import { emptyScope, resolveScope } from "./db/queries.ts";
 
 function readMacos(): StatusReport["macos"] {
@@ -41,6 +41,8 @@ export function getStatus(config: Config): StatusReport {
     allow_unscoped: config.allowUnscoped,
     unscoped: !isScopeActive(config),
     scope: emptyScope(config),
+    temp_copy_bytes: null,
+    snapshot_age_ms: null,
     schema: null,
   };
 
@@ -67,6 +69,9 @@ export function getStatus(config: Config): StatusReport {
         has_chat_message_join: tables.includes("chat_message_join"),
       };
       base.scope = resolveScope(opened.db, config);
+      const snap = getSnapshotInfo(config.dbPath);
+      base.temp_copy_bytes = snap.temp_copy_bytes;
+      base.snapshot_age_ms = snap.snapshot_age_ms;
       base.ok = true;
       base.error = null;
       return base;

@@ -4,6 +4,7 @@ import {
   encodeAttributedBody,
   resolveMessageText,
 } from "../src/decode/attributedBody.ts";
+import { TAHOE_SAMPLE_BLOB, TAHOE_SAMPLE_TEXT } from "./fixtures/tahoe-attributed-body.ts";
 
 describe("attributedBody", () => {
   it("round-trips a short NSString payload", () => {
@@ -37,5 +38,18 @@ describe("attributedBody", () => {
 
   it("marks attachment-only rows as none", () => {
     expect(resolveMessageText(null, null)).toEqual({ text: "", source: "none" });
+  });
+
+  it("marks extractPrintable fallback as guess", () => {
+    const junk = Buffer.from("NSAttributedString class junk meet-at-seven leftover", "utf8");
+    expect(resolveMessageText(null, junk)).toMatchObject({ source: "guess" });
+  });
+
+  it("decodes a streamtyped / NSAttributedString Tahoe-shaped fixture", () => {
+    expect(decodeAttributedBody(TAHOE_SAMPLE_BLOB)).toBe(TAHOE_SAMPLE_TEXT);
+    expect(resolveMessageText(null, TAHOE_SAMPLE_BLOB)).toEqual({
+      text: TAHOE_SAMPLE_TEXT,
+      source: "attributedBody",
+    });
   });
 });

@@ -23,18 +23,24 @@ export function makeConfig(overrides: Partial<Config> & { dbPath: string }): Con
     dbMode: "direct",
     enableSend: false,
     redactPreviews: false,
-    scopeDisplayName: null,
-    scopeChatId: null,
-    scopeAllowlist: [],
+    scope: [],
     allowUnscoped: false,
     ...overrides,
   };
 }
 
-/** Optional allowlist pinned to the fixture group. */
+export function makeUnscopedConfig(overrides: Partial<Config> & { dbPath: string }): Config {
+  return makeConfig({
+    allowUnscoped: true,
+    ...overrides,
+  });
+}
+
+/** Allowlist pinned to the fixture group. */
 export function makeScopedConfig(overrides: Partial<Config> & { dbPath: string }): Config {
   return makeConfig({
-    scopeDisplayName: GROUP_NAME,
+    scope: [GROUP_NAME],
+    allowUnscoped: false,
     ...overrides,
   });
 }
@@ -267,5 +273,139 @@ export function createFixtureDb(dir?: string): { path: string; ids: FixtureIds; 
     cleanup: () => {
       rmSync(root, { recursive: true, force: true });
     },
+  };
+}
+
+export const OLDEST_HANDLE = "+15559990001";
+export const TAHOE_WINDOW = 200;
+
+export type ResolveFixture = {
+  path: string;
+  oldestChatId: number;
+  oldestGuid: string;
+  cleanup: () => void;
+};
+
+/** 101 chats; the oldest (lowest ROWID, oldest last message) is Weekend Plans. */
+export function createResolveDepthFixture(): ResolveFixture {
+  const root = mkdtempSync(join(tmpdir(), "apple-messages-resolve-"));
+  const path = join(root, "chat.db");
+  const { ids } = createFixtureDb(root);
+  const db = new DatabaseSync(path);
+  const insertHandle = db.prepare(
+    `INSERT INTO handle (id, country, service) VALUES (?, 'us', 'iMessage')`,
+  );
+  const insertChat = db.prepare(
+    `INSERT INTO chat (guid, style, state, chat_identifier, service_name, display_name)
+     VALUES (?, 45, 3, ?, 'iMessage', ?)`,
+  );
+  const insertJoin = db.prepare(
+    `INSERT INTO chat_handle_join (chat_id, handle_id) VALUES (?, ?)`,
+  );
+  const insertMessage = db.prepare(
+    `INSERT INTO message (guid, text, handle_id, date, is_from_me, service, associated_message_type, item_type)
+     VALUES (?, ?, ?, ?, 0, 'iMessage', 0, 0)`,
+  );
+  const joinMessage = db.prepare(
+    `INSERT INTO chat_message_join (chat_id, message_id, message_date) VALUES (?, ?, ?)`,
+  );
+
+  const oldestHandleId = Number(insertHandle.run(OLDEST_HANDLE).lastInsertRowid);
+  insertJoin.run(ids.groupChatId, oldestHandleId);
+
+  for (let i = 0; i < 99; i += 1) {
+    const handleId = Number(
+      insertHandle.run(`+1555888${String(i).padStart(4, "0")}`).lastInsertRowid,
+    );
+    const chatId = Number(
+      insertChat.run(
+        `iMessage;-;hot-${i}`,
+        `+1555888${String(i).padStart(4, "0")}`,
+        `Hot Chat ${i}`,
+      ).lastInsertRowid,
+    );
+    insertJoin.run(chatId, handleId);
+    const iso = `2026-06-01T${String(Math.floor(i / 60)).padStart(2, "0")}:${String(i % 60).padStart(2, "0")}:00Z`;
+    const date = isoToAppleNanos(iso).toString();
+    const messageId = Number(
+      insertMessage.run(`hot-msg-${i}`, `hot noise ${i}`, handleId, date).lastInsertRowid,
+    );
+    joinMessage.run(chatId, messageId, date);
+  }
+
+  const guidRow = db
+    .prepare(`SELECT guid FROM chat WHERE ROWID = ?`)
+    .get(ids.groupChatId) as { guid: string };
+  db.close();
+
+  return {
+    path,
+    oldestChatId: ids.groupChatId,
+    oldestGuid: guidRow.guid,
+    cleanup: () => {
+      rmSync(root, { recursive: true, force: true });
+    },
+  };
+}
+
+export type SearchFixture = {
+  path: string;
+  chatId: number;
+  cleanup: () => void;
+};
+
+/** Old plain-text, old Tahoe-only, then enough recent Tahoe rows to exhaust the decode window. */
+export function createSearchWindowFixture(): SearchFixture {
+  const root = mkdtempSync(join(tmpdir(), "apple-messages-search-"));
+  mkdirSync(root, { recursive: true });
+  const path = join(root, "chat.db");
+  const created = createFixtureDb(root);
+  const db = new DatabaseSync(path);
+  const insertMessage = db.prepare(
+    `INSERT INTO message (guid, text, attributedBody, handle_id, date, is_from_me, service, associated_message_type, item_type)
+     VALUES (?, ?, ?, 1, ?, 0, 'iMessage', 0, 0)`,
+  );
+  const joinMessage = db.prepare(
+    `INSERT INTO chat_message_join (chat_id, message_id, message_date) VALUES (?, ?, ?)`,
+  );
+  const add = (
+    guid: string,
+    text: string | null,
+    body: Buffer | null,
+    iso: string,
+  ): void => {
+    const date = isoToAppleNanos(iso).toString();
+    const id = Number(insertMessage.run(guid, text, body, date).lastInsertRowid);
+    joinMessage.run(created.ids.groupChatId, id, date);
+  };
+
+  add("old-plain", "Dentist 2019 appointment", null, "2019-04-01T12:00:00Z");
+  add(
+    "old-tahoe",
+    null,
+    encodeAttributedBody("ancient secret blob"),
+    "2019-06-01T12:00:00Z",
+  );
+  for (let i = 0; i < TAHOE_WINDOW + 1; i += 1) {
+    const minute = i % 60;
+    const hour = 10 + Math.floor(i / 60);
+    add(
+      `tahoe-noise-${i}`,
+      null,
+      encodeAttributedBody(`recent blob ${i}`),
+      `2026-07-01T${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:00Z`,
+    );
+  }
+  add(
+    "recent-tahoe",
+    null,
+    encodeAttributedBody("meet at the clinic tonight"),
+    "2026-08-01T18:00:00Z",
+  );
+  db.close();
+  return {
+    path,
+    chatId: created.ids.groupChatId,
+    cleanup: created.cleanup,
   };
 }

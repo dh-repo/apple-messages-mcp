@@ -1,7 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { resolveMessageText } from "../decode/attributedBody.ts";
 import { maybeRedact } from "../redact.ts";
-import { ALLOWLIST_NOTE, isScopeActive, UNSCOPED_NOTE } from "../config.ts";
+import { ALLOWLIST_NOTE, isScopeActive, SCOPED_SHUT_NOTE, UNSCOPED_NOTE } from "../config.ts";
 import type {
   AttachmentMeta,
   ChatSummary,
@@ -9,10 +9,11 @@ import type {
   Handle,
   MessageRow,
   ScopeMatch,
+  SearchResult,
 } from "../types.ts";
 import { MessagesError } from "../types.ts";
 import { appleDateToIso, isoToAppleNanos, isIsoDate } from "./dates.ts";
-import { handlesMatch } from "./handles.ts";
+import { handlesMatch, looksLikeHandle } from "./handles.ts";
 import { listTables, tableColumns } from "./open.ts";
 
 const DEFAULT_CHAT_LIMIT = 30;
@@ -21,6 +22,18 @@ const DEFAULT_THREAD_LIMIT = 50;
 const MAX_THREAD_LIMIT = 200;
 const DEFAULT_SEARCH_LIMIT = 25;
 const MAX_SEARCH_LIMIT = 100;
+const TAHOE_SCAN_FLOOR = 200;
+
+export type ChatIdentity = {
+  chat_id: number;
+  guid: string;
+  chat_identifier: string | null;
+  display_name: string | null;
+  service: string | null;
+  is_archived: boolean;
+  handles: Handle[];
+  style: number | null;
+};
 
 function clamp(value: number | undefined, fallback: number, max: number): number {
   if (value === undefined || !Number.isFinite(value)) return fallback;
@@ -78,14 +91,19 @@ function namesSimilar(a: string, b: string): boolean {
 }
 
 export function collectScopeTokens(config: Config): string[] {
-  const tokens: string[] = [];
-  if (config.scopeDisplayName) tokens.push(config.scopeDisplayName);
-  if (config.scopeChatId !== null) tokens.push(String(config.scopeChatId));
-  for (const item of config.scopeAllowlist) tokens.push(item);
-  return [...new Set(tokens)];
+  return [...new Set(config.scope)];
 }
 
-export function chatMatchesToken(chat: ChatSummary, token: string): boolean {
+function configuredName(tokens: string[]): string | null {
+  return tokens.find((token) => !/^\d+$/.test(token)) ?? null;
+}
+
+function configuredChatId(tokens: string[]): number | null {
+  const token = tokens.find((item) => /^\d+$/.test(item));
+  return token ? Number(token) : null;
+}
+
+export function chatMatchesToken(chat: ChatSummary | ChatIdentity, token: string): boolean {
   if (/^\d+$/.test(token) && chat.chat_id === Number(token)) return true;
   if (chat.display_name && namesSimilar(chat.display_name, token)) return true;
   if (chat.display_name?.toLowerCase().includes(token.toLowerCase())) return true;
@@ -94,15 +112,38 @@ export function chatMatchesToken(chat: ChatSummary, token: string): boolean {
   return false;
 }
 
+function identityToSummary(identity: ChatIdentity): ChatSummary {
+  return {
+    chat_id: identity.chat_id,
+    guid: identity.guid,
+    chat_identifier: identity.chat_identifier,
+    display_name: identity.display_name,
+    service: identity.service,
+    is_group: isGroupChat({
+      style: identity.style,
+      displayName: identity.display_name,
+      identifier: identity.chat_identifier,
+      handleCount: identity.handles.length,
+    }),
+    is_archived: identity.is_archived,
+    handles: identity.handles,
+    last_message_at: null,
+    last_preview: null,
+    message_count: 0,
+  };
+}
+
 export function emptyScope(config: Config): ScopeMatch {
   const active = isScopeActive(config);
+  const tokens = collectScopeTokens(config);
+  const shut = active && tokens.length === 0;
   return {
     active,
     mode: active ? "allowlist" : "unscoped",
-    note: active ? ALLOWLIST_NOTE : UNSCOPED_NOTE,
-    configured_name: config.scopeDisplayName,
-    configured_chat_id: config.scopeChatId,
-    allowlist: collectScopeTokens(config),
+    note: !active ? UNSCOPED_NOTE : shut ? SCOPED_SHUT_NOTE : ALLOWLIST_NOTE,
+    configured_name: configuredName(tokens),
+    configured_chat_id: configuredChatId(tokens),
+    allowlist: tokens,
     matched: !active,
     chat: null,
     chats: [],
@@ -133,13 +174,76 @@ export function loadHandlesForChat(db: DatabaseSync, chatId: number): Handle[] {
   }));
 }
 
+function loadAllHandlesByChat(db: DatabaseSync): Map<number, Handle[]> {
+  const map = new Map<number, Handle[]>();
+  const tables = new Set(listTables(db));
+  if (!tables.has("chat_handle_join") || !tables.has("handle")) return map;
+  const handleCols = tableColumns(db, "handle");
+  const countrySel = hasColumn(handleCols, "country") ? "h.country" : "NULL AS country";
+  const rows = db
+    .prepare(
+      `SELECT j.chat_id AS chat_id, h.ROWID AS handle_id, h.id, h.service, ${countrySel}
+       FROM chat_handle_join j
+       JOIN handle h ON h.ROWID = j.handle_id
+       ORDER BY j.chat_id, h.ROWID`,
+    )
+    .all() as Array<Record<string, unknown>>;
+  for (const row of rows) {
+    const chatId = asNumber(row.chat_id) ?? 0;
+    const list = map.get(chatId) ?? [];
+    list.push({
+      handle_id: asNumber(row.handle_id) ?? 0,
+      id: asString(row.id) ?? "",
+      service: asString(row.service) ?? "",
+      country: asString(row.country),
+    });
+    map.set(chatId, list);
+  }
+  return map;
+}
+
+/** Cheap identity: ROWID, guid, chat_identifier, handles. No COUNT(*) or last-message join. */
+export function listChatIdentities(db: DatabaseSync): ChatIdentity[] {
+  const tables = new Set(listTables(db));
+  if (!tables.has("chat")) return [];
+  const chatCols = tableColumns(db, "chat");
+  const display = hasColumn(chatCols, "display_name") ? "c.display_name" : "NULL AS display_name";
+  const identifier = hasColumn(chatCols, "chat_identifier")
+    ? "c.chat_identifier"
+    : "NULL AS chat_identifier";
+  const service = hasColumn(chatCols, "service_name") ? "c.service_name" : "NULL AS service_name";
+  const archived = hasColumn(chatCols, "is_archived") ? "c.is_archived" : "0 AS is_archived";
+  const style = hasColumn(chatCols, "style") ? "c.style" : "NULL AS style";
+  const rows = db
+    .prepare(
+      `SELECT c.ROWID AS chat_id, c.guid, ${identifier}, ${display}, ${service}, ${archived}, ${style}
+       FROM chat c`,
+    )
+    .all() as Array<Record<string, unknown>>;
+  const handles = loadAllHandlesByChat(db);
+  return rows.map((row) => {
+    const chatId = asNumber(row.chat_id) ?? 0;
+    return {
+      chat_id: chatId,
+      guid: asString(row.guid) ?? "",
+      chat_identifier: asString(row.chat_identifier),
+      display_name: asString(row.display_name),
+      service: asString(row.service_name),
+      is_archived: (asNumber(row.is_archived) ?? 0) === 1,
+      handles: handles.get(chatId) ?? [],
+      style: asNumber(row.style),
+    };
+  });
+}
+
 function mapChat(
   db: DatabaseSync,
   row: Record<string, unknown>,
   redact: boolean,
+  handles?: Handle[],
 ): ChatSummary {
   const chatId = asNumber(row.chat_id) ?? 0;
-  const handles = loadHandlesForChat(db, chatId);
+  const resolvedHandles = handles ?? loadHandlesForChat(db, chatId);
   const displayName = asString(row.display_name);
   const identifier = asString(row.chat_identifier);
   const style = asNumber(row.style);
@@ -158,10 +262,10 @@ function mapChat(
       style,
       displayName,
       identifier,
-      handleCount: handles.length,
+      handleCount: resolvedHandles.length,
     }),
     is_archived: (asNumber(row.is_archived) ?? 0) === 1,
-    handles,
+    handles: resolvedHandles,
     last_message_at: appleDateToIso(asAppleDate(row.last_date)),
     last_preview: resolved.text ? maybeRedact(resolved.text, redact) : null,
     message_count: asNumber(row.message_count) ?? 0,
@@ -226,7 +330,7 @@ function chatSelectSql(chatCols: Set<string>, messageCols: Set<string>): string 
 
 export function listChats(
   db: DatabaseSync,
-  opts: { limit?: number; query?: string; redact: boolean },
+  opts: { limit?: number; query?: string; redact: boolean; chatIds?: number[] },
 ): ChatSummary[] {
   const tables = new Set(listTables(db));
   if (!tables.has("chat") || !tables.has("message") || !tables.has("chat_message_join")) {
@@ -236,28 +340,49 @@ export function listChats(
     );
   }
 
-  const sql = `${chatSelectSql(tableColumns(db, "chat"), tableColumns(db, "message"))}
-    ORDER BY last_date DESC, c.ROWID DESC
-    LIMIT ?`;
-  const rows = db.prepare(sql).all(clamp(opts.limit, DEFAULT_CHAT_LIMIT, MAX_CHAT_LIMIT)) as Array<
-    Record<string, unknown>
-  >;
+  const clauses: string[] = ["1=1"];
+  const params: Array<string | number> = [];
+  if (opts.chatIds && opts.chatIds.length > 0) {
+    clauses.push(`c.ROWID IN (${opts.chatIds.map(() => "?").join(", ")})`);
+    params.push(...opts.chatIds);
+  } else if (opts.chatIds && opts.chatIds.length === 0) {
+    return [];
+  }
 
-  let chats = rows.map((row) => mapChat(db, row, opts.redact));
   const query = opts.query?.trim();
   if (query) {
-    const q = query.toLowerCase();
-    chats = chats.filter((chat) => {
-      if (chat.display_name?.toLowerCase().includes(q)) return true;
-      if (chat.chat_identifier?.toLowerCase().includes(q)) return true;
-      if (chat.guid.toLowerCase().includes(q)) return true;
-      return chat.handles.some(
-        (handle) =>
-          handle.id.toLowerCase().includes(q) || handlesMatch(handle.id, query),
-      );
-    });
+    const like = `%${query.toLowerCase()}%`;
+    clauses.push(`(
+      LOWER(IFNULL(c.display_name, '')) LIKE ?
+      OR LOWER(IFNULL(c.chat_identifier, '')) LIKE ?
+      OR LOWER(IFNULL(c.guid, '')) LIKE ?
+      OR EXISTS (
+        SELECT 1 FROM chat_handle_join j
+        JOIN handle h ON h.ROWID = j.handle_id
+        WHERE j.chat_id = c.ROWID AND LOWER(h.id) LIKE ?
+      )
+    )`);
+    params.push(like, like, like, like);
   }
-  return chats;
+
+  const sql = `${chatSelectSql(tableColumns(db, "chat"), tableColumns(db, "message"))}
+    WHERE ${clauses.join(" AND ")}
+    ORDER BY last_date DESC, c.ROWID DESC
+    LIMIT ?`;
+  params.push(clamp(opts.limit, DEFAULT_CHAT_LIMIT, MAX_CHAT_LIMIT));
+
+  const rows = db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+  const chats = rows.map((row) => mapChat(db, row, opts.redact));
+  if (!query) return chats;
+  return chats.filter((chat) => {
+    const q = query.toLowerCase();
+    if (chat.display_name?.toLowerCase().includes(q)) return true;
+    if (chat.chat_identifier?.toLowerCase().includes(q)) return true;
+    if (chat.guid.toLowerCase().includes(q)) return true;
+    return chat.handles.some(
+      (handle) => handle.id.toLowerCase().includes(q) || handlesMatch(handle.id, query),
+    );
+  });
 }
 
 export function getChatById(
@@ -275,6 +400,21 @@ export function getChatById(
   return mapChat(db, row, redact);
 }
 
+export function getChatByGuid(
+  db: DatabaseSync,
+  guid: string,
+  redact: boolean,
+): ChatSummary | null {
+  const tables = new Set(listTables(db));
+  if (!tables.has("chat")) return null;
+  const sql = `${chatSelectSql(tableColumns(db, "chat"), tableColumns(db, "message"))}
+    WHERE c.guid = ?
+    LIMIT 1`;
+  const row = db.prepare(sql).get(guid) as Record<string, unknown> | undefined;
+  if (!row) return null;
+  return mapChat(db, row, redact);
+}
+
 export function resolveScope(db: DatabaseSync, config: Config): ScopeMatch {
   const base = emptyScope(config);
   if (!base.active) {
@@ -282,16 +422,48 @@ export function resolveScope(db: DatabaseSync, config: Config): ScopeMatch {
   }
 
   const tokens = collectScopeTokens(config);
-  const chats = listChats(db, { limit: MAX_CHAT_LIMIT, redact: config.redactPreviews });
-  const matched = chats.filter((chat) =>
-    tokens.some((token) => chatMatchesToken(chat, token)),
-  );
+  if (tokens.length === 0) {
+    return {
+      ...base,
+      matched: false,
+      candidates: listGroupNameCandidates(db),
+    };
+  }
+
+  const identities = listChatIdentities(db);
+  const matched: ChatIdentity[] = [];
+  const seen = new Set<number>();
+  const push = (identity: ChatIdentity | undefined): void => {
+    if (!identity || seen.has(identity.chat_id)) return;
+    seen.add(identity.chat_id);
+    matched.push(identity);
+  };
+
+  for (const token of tokens) {
+    if (/^\d+$/.test(token)) {
+      push(identities.find((chat) => chat.chat_id === Number(token)));
+      continue;
+    }
+    if (looksLikeHandle(token)) {
+      for (const identity of identities) {
+        if (identity.handles.some((handle) => handlesMatch(handle.id, token))) {
+          push(identity);
+        }
+      }
+      continue;
+    }
+    for (const identity of identities) {
+      if (chatMatchesToken(identity, token)) push(identity);
+    }
+  }
+
+  const chats = matched.map(identityToSummary);
   const candidates = matched.length > 0 ? [] : listGroupNameCandidates(db);
   return {
     ...base,
     matched: matched.length > 0,
-    chat: matched[0] ?? null,
-    chats: matched,
+    chat: chats[0] ?? null,
+    chats,
     candidates,
   };
 }
@@ -327,6 +499,9 @@ export function assertChatAllowed(
   if (scope.chats.some((allowed) => allowed.chat_id === chat.chat_id)) return;
   const tokens = collectScopeTokens(config);
   if (tokens.some((token) => chatMatchesToken(chat, token))) return;
+  if (chat.handles.some((handle) => tokens.some((token) => handlesMatch(handle.id, token)))) {
+    return;
+  }
   throw new MessagesError(
     "SCOPE",
     `Refusing chat_id ${chat.chat_id} (${chat.display_name ?? chat.chat_identifier ?? chat.guid}). This server is restricted to allowlist: ${tokens.join(", ") || "(empty)"}.`,
@@ -334,8 +509,24 @@ export function assertChatAllowed(
 }
 
 function findChatsForHandle(db: DatabaseSync, handle: string, redact: boolean): ChatSummary[] {
-  const chats = listChats(db, { limit: MAX_CHAT_LIMIT, redact });
-  return chats.filter((chat) => chat.handles.some((h) => handlesMatch(h.id, handle)));
+  const tables = new Set(listTables(db));
+  if (!tables.has("chat_handle_join") || !tables.has("handle")) return [];
+  const rows = db
+    .prepare(
+      `SELECT j.chat_id AS chat_id, h.id AS id
+       FROM chat_handle_join j
+       JOIN handle h ON h.ROWID = j.handle_id`,
+    )
+    .all() as Array<Record<string, unknown>>;
+  const chatIds = new Set<number>();
+  for (const row of rows) {
+    const id = asString(row.id) ?? "";
+    const chatId = asNumber(row.chat_id);
+    if (chatId !== null && handlesMatch(id, handle)) chatIds.add(chatId);
+  }
+  return [...chatIds]
+    .map((chatId) => getChatById(db, chatId, redact))
+    .filter((chat): chat is ChatSummary => chat !== null);
 }
 
 export function resolveRequestedChat(
@@ -355,6 +546,11 @@ export function resolveRequestedChat(
   }
 
   if (args.handle) {
+    const byGuid = getChatByGuid(db, args.handle, config.redactPreviews);
+    if (byGuid) {
+      assertChatAllowed(config, scope, byGuid);
+      return { chat: byGuid, scope };
+    }
     const matches = findChatsForHandle(db, args.handle, config.redactPreviews);
     const allowed = isScopeActive(config)
       ? matches.filter((chat) => {
@@ -386,7 +582,8 @@ export function resolveRequestedChat(
   }
 
   if (scope.active && scope.chats.length === 1 && scope.chat) {
-    return { chat: scope.chat, scope };
+    const rich = getChatById(db, scope.chat.chat_id, config.redactPreviews);
+    return { chat: rich ?? scope.chat, scope };
   }
   if (scope.active && !scope.matched) {
     throw new MessagesError(
@@ -496,6 +693,28 @@ function messageSelectSql(messageCols: Set<string>, handleCols: Set<string>): st
   `;
 }
 
+function pushDateRange(
+  clauses: string[],
+  params: Array<string | number>,
+  fromDate?: string,
+  toDate?: string,
+): void {
+  if (fromDate) {
+    if (!isIsoDate(fromDate)) {
+      throw new MessagesError("INVALID_ARGS", "from_date must be an ISO-8601 timestamp.");
+    }
+    clauses.push("m.date >= ?");
+    params.push(isoToAppleNanos(fromDate).toString());
+  }
+  if (toDate) {
+    if (!isIsoDate(toDate)) {
+      throw new MessagesError("INVALID_ARGS", "to_date must be an ISO-8601 timestamp.");
+    }
+    clauses.push("m.date <= ?");
+    params.push(isoToAppleNanos(toDate).toString());
+  }
+}
+
 export function getThread(
   db: DatabaseSync,
   opts: {
@@ -504,6 +723,8 @@ export function getThread(
     before?: string | number;
     redact: boolean;
     includeReactions?: boolean;
+    fromDate?: string;
+    toDate?: string;
   },
 ): MessageRow[] {
   const messageCols = tableColumns(db, "message");
@@ -517,6 +738,7 @@ export function getThread(
   if (hasColumn(messageCols, "item_type")) {
     clauses.push("(m.item_type IS NULL OR m.item_type = 0)");
   }
+  pushDateRange(clauses, params, opts.fromDate, opts.toDate);
 
   if (opts.before !== undefined && opts.before !== "") {
     if (typeof opts.before === "number" || /^-?\d+$/.test(String(opts.before))) {
@@ -550,27 +772,41 @@ export function findChatByRef(
   ref: string,
 ): ChatSummary {
   const scope = resolveScope(db, config);
-  const chats = isScopeActive(config)
-    ? scope.chats
-    : listChats(db, { limit: MAX_CHAT_LIMIT, redact: config.redactPreviews });
-  const matches = chats.filter(
-    (chat) =>
-      chatMatchesToken(chat, ref) ||
-      String(chat.chat_id) === ref ||
-      chat.guid === ref,
-  );
-  if (matches.length === 0) {
+  if (/^\d+$/.test(ref)) {
+    const chat = getChatById(db, Number(ref), config.redactPreviews);
+    if (!chat) throw new MessagesError("NOT_FOUND", `No in-scope chat matches "${ref}".`);
+    assertChatAllowed(config, scope, chat);
+    return chat;
+  }
+  const byGuid = getChatByGuid(db, ref, config.redactPreviews);
+  if (byGuid) {
+    assertChatAllowed(config, scope, byGuid);
+    return byGuid;
+  }
+  if (looksLikeHandle(ref)) {
+    return resolveRequestedChat(db, config, { handle: ref }).chat;
+  }
+  const identities = listChatIdentities(db).filter((chat) => chatMatchesToken(chat, ref));
+  const allowed = identities
+    .map(identityToSummary)
+    .filter((chat) => {
+      try {
+        assertChatAllowed(config, scope, chat);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+  if (allowed.length === 0) {
     throw new MessagesError("NOT_FOUND", `No in-scope chat matches "${ref}".`);
   }
-  if (matches.length > 1) {
+  if (allowed.length > 1) {
     throw new MessagesError(
       "INVALID_ARGS",
-      `"${ref}" matches ${matches.length} chats. Pass a chat_id.`,
+      `"${ref}" matches ${allowed.length} chats. Pass a chat_id or guid.`,
     );
   }
-  const chat = matches[0]!;
-  assertChatAllowed(config, scope, chat);
-  return chat;
+  return getChatById(db, allowed[0]!.chat_id, config.redactPreviews) ?? allowed[0]!;
 }
 
 export function searchMessages(
@@ -581,8 +817,10 @@ export function searchMessages(
     chatIds?: number[];
     limit?: number;
     redact: boolean;
+    fromDate?: string;
+    toDate?: string;
   },
-): MessageRow[] {
+): SearchResult {
   const query = opts.query.trim();
   if (!query) {
     throw new MessagesError("INVALID_ARGS", "query must be a non-empty string.");
@@ -590,60 +828,92 @@ export function searchMessages(
 
   const messageCols = tableColumns(db, "message");
   const handleCols = tableColumns(db, "handle");
-  const clauses = ["1=1"];
-  const params: Array<string | number> = [];
+  const limit = clamp(opts.limit, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT);
+  const window = Math.max(limit * 20, TAHOE_SCAN_FLOOR);
+  const needle = query.toLowerCase();
+  const like = `%${needle}%`;
 
+  const baseClauses = ["1=1"];
+  const baseParams: Array<string | number> = [];
   if (opts.chatId !== undefined) {
-    clauses.push("cmj.chat_id = ?");
-    params.push(opts.chatId);
+    baseClauses.push("cmj.chat_id = ?");
+    baseParams.push(opts.chatId);
   } else if (opts.chatIds && opts.chatIds.length > 0) {
-    clauses.push(`cmj.chat_id IN (${opts.chatIds.map(() => "?").join(", ")})`);
-    params.push(...opts.chatIds);
+    baseClauses.push(`cmj.chat_id IN (${opts.chatIds.map(() => "?").join(", ")})`);
+    baseParams.push(...opts.chatIds);
   }
   if (hasColumn(messageCols, "associated_message_type")) {
-    clauses.push("(m.associated_message_type IS NULL OR m.associated_message_type = 0)");
+    baseClauses.push("(m.associated_message_type IS NULL OR m.associated_message_type = 0)");
   }
   if (hasColumn(messageCols, "item_type")) {
-    clauses.push("(m.item_type IS NULL OR m.item_type = 0)");
+    baseClauses.push("(m.item_type IS NULL OR m.item_type = 0)");
   }
+  pushDateRange(baseClauses, baseParams, opts.fromDate, opts.toDate);
 
-  const scanLimit = Math.max(clamp(opts.limit, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT) * 20, 200);
-  const sql = `${messageSelectSql(messageCols, handleCols)}
-    WHERE ${clauses.join(" AND ")}
+  const select = messageSelectSql(messageCols, handleCols);
+  const byId = new Map<number, MessageRow>();
+
+  const plainSql = `${select}
+    WHERE ${baseClauses.join(" AND ")}
+      AND m.text IS NOT NULL AND trim(m.text) != ''
+      AND LOWER(m.text) LIKE ?
     ORDER BY m.date DESC, m.ROWID DESC
-    LIMIT ?`;
-  params.push(scanLimit);
-
-  const rows = db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
-  const needle = query.toLowerCase();
-  const matched: MessageRow[] = [];
-  const limit = clamp(opts.limit, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT);
-
-  for (const row of rows) {
+    LIMIT ${limit}`;
+  const plainRows = db.prepare(plainSql).all(...baseParams, like) as Array<
+    Record<string, unknown>
+  >;
+  for (const row of plainRows) {
     const mapped = mapMessage(db, row, false);
-    if (mapped.text.toLowerCase().includes(needle)) {
-      matched.push({
-        ...mapped,
-        text: maybeRedact(mapped.text, opts.redact),
-      });
-    }
-    if (matched.length >= limit) break;
+    byId.set(mapped.message_id, { ...mapped, text: maybeRedact(mapped.text, opts.redact) });
   }
-  return matched;
+
+  const tahoeSql = `${select}
+    WHERE ${baseClauses.join(" AND ")}
+      AND (m.text IS NULL OR trim(m.text) = '')
+    ORDER BY m.date DESC, m.ROWID DESC
+    LIMIT ${window}`;
+  const tahoeRows = db.prepare(tahoeSql).all(...baseParams) as Array<
+    Record<string, unknown>
+  >;
+  let scanned = 0;
+  for (const row of tahoeRows) {
+    scanned += 1;
+    const mapped = mapMessage(db, row, false);
+    if (mapped.text.toLowerCase().includes(needle) && !byId.has(mapped.message_id)) {
+      byId.set(mapped.message_id, { ...mapped, text: maybeRedact(mapped.text, opts.redact) });
+    }
+  }
+
+  const messages = [...byId.values()]
+    .sort((a, b) => {
+      const at = a.sent_at ?? "";
+      const bt = b.sent_at ?? "";
+      if (at === bt) return b.message_id - a.message_id;
+      return at < bt ? 1 : -1;
+    })
+    .slice(0, limit);
+
+  return {
+    messages,
+    truncated: tahoeRows.length >= window,
+    scanned,
+  };
 }
 
 export type ChatWatermark = {
   chat_id: number;
-  newest_message_id: number | null;
+  guid: string;
+  chat_identifier: string | null;
+  display_name: string | null;
+  newest_message_id: number;
   newest_at: string | null;
-  count: number;
 };
 
-/** High-water mark for the Phase 2 watcher. IDs only — no message text. */
-export function getChatWatermark(
+/** Per-chat high-water marks. IDs only — no message text. */
+export function getChatWatermarks(
   db: DatabaseSync,
   chatIds: number[] | null,
-): ChatWatermark {
+): ChatWatermark[] {
   const where =
     chatIds === null
       ? "1=1"
@@ -651,60 +921,47 @@ export function getChatWatermark(
         ? "0"
         : `cmj.chat_id IN (${chatIds.map(() => "?").join(", ")})`;
   const params: number[] = chatIds ?? [];
-  const row = db
+  const rows = db
     .prepare(
       `SELECT
+         cmj.chat_id AS chat_id,
+         c.guid AS guid,
+         c.chat_identifier AS chat_identifier,
+         c.display_name AS display_name,
          CAST(MAX(m.ROWID) AS TEXT) AS newest_message_id,
-         CAST(MAX(m.date) AS TEXT) AS newest_date,
-         COUNT(*) AS count
+         CAST(MAX(m.date) AS TEXT) AS newest_date
        FROM message m
        JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
-       WHERE ${where}`,
+       JOIN chat c ON c.ROWID = cmj.chat_id
+       WHERE ${where}
+       GROUP BY cmj.chat_id`,
     )
-    .get(...params) as Record<string, unknown> | undefined;
+    .all(...params) as Array<Record<string, unknown>>;
 
-  let chatId: number | null = chatIds && chatIds.length === 1 ? (chatIds[0] ?? null) : null;
-  const newestId = asNumber(row?.newest_message_id);
-  if (newestId !== null && chatId === null) {
-    const owner = db
-      .prepare(
-        `SELECT cmj.chat_id AS chat_id
-         FROM chat_message_join cmj
-         WHERE cmj.message_id = ?
-         LIMIT 1`,
-      )
-      .get(newestId) as Record<string, unknown> | undefined;
-    chatId = asNumber(owner?.chat_id);
-  }
-
-  return {
-    chat_id: chatId ?? 0,
-    newest_message_id: newestId,
-    newest_at: appleDateToIso(asAppleDate(row?.newest_date)),
-    count: asNumber(row?.count) ?? 0,
-  };
+  return rows
+    .map((row) => ({
+      chat_id: asNumber(row.chat_id) ?? 0,
+      guid: asString(row.guid) ?? "",
+      chat_identifier: asString(row.chat_identifier),
+      display_name: asString(row.display_name),
+      newest_message_id: asNumber(row.newest_message_id) ?? 0,
+      newest_at: appleDateToIso(asAppleDate(row.newest_date)),
+    }))
+    .filter((row) => row.chat_id > 0 && row.newest_message_id > 0);
 }
 
-export function countMessagesAfter(
+export function countMessagesAfterInChat(
   db: DatabaseSync,
-  chatIds: number[] | null,
+  chatId: number,
   afterMessageId: number,
 ): number {
-  const where =
-    chatIds === null
-      ? "m.ROWID > ?"
-      : chatIds.length === 0
-        ? "0"
-        : `cmj.chat_id IN (${chatIds.map(() => "?").join(", ")}) AND m.ROWID > ?`;
-  const params: number[] =
-    chatIds === null ? [afterMessageId] : [...chatIds, afterMessageId];
   const row = db
     .prepare(
       `SELECT COUNT(*) AS n
        FROM message m
        JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
-       WHERE ${where}`,
+       WHERE cmj.chat_id = ? AND m.ROWID > ?`,
     )
-    .get(...params) as Record<string, unknown> | undefined;
+    .get(chatId, afterMessageId) as Record<string, unknown> | undefined;
   return asNumber(row?.n) ?? 0;
 }

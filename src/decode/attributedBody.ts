@@ -55,28 +55,34 @@ function readLength(buf: Buffer, start: number): { len: number; next: number } |
   return { len: first, next: start + 1 };
 }
 
-export function decodeAttributedBody(
+export function decodeAttributedBodyDetailed(
   blob: Uint8Array | Buffer | null | undefined,
-): string | null {
-  if (!blob || blob.length === 0) return null;
+): { text: string | null; guessed: boolean } {
+  if (!blob || blob.length === 0) return { text: null, guessed: false };
   const buf = Buffer.isBuffer(blob) ? blob : Buffer.from(blob);
 
   let i = buf.indexOf(NSSTRING);
-  if (i < 0) return extractPrintable(buf);
+  if (i < 0) return { text: extractPrintable(buf), guessed: true };
 
   i += NSSTRING.length;
   while (i < buf.length && buf[i] !== 0x2b) i += 1;
-  if (i >= buf.length) return extractPrintable(buf);
+  if (i >= buf.length) return { text: extractPrintable(buf), guessed: true };
   i += 1;
 
   const parsed = readLength(buf, i);
   if (!parsed || parsed.len <= 0 || parsed.next + parsed.len > buf.length) {
-    return extractPrintable(buf);
+    return { text: extractPrintable(buf), guessed: true };
   }
 
   const text = buf.toString("utf8", parsed.next, parsed.next + parsed.len);
-  if (!isMostlyText(text)) return extractPrintable(buf);
-  return text;
+  if (!isMostlyText(text)) return { text: extractPrintable(buf), guessed: true };
+  return { text, guessed: false };
+}
+
+export function decodeAttributedBody(
+  blob: Uint8Array | Buffer | null | undefined,
+): string | null {
+  return decodeAttributedBodyDetailed(blob).text;
 }
 
 /** Test helper: wrap a UTF-8 string in a minimal NSString-shaped blob. */
@@ -100,11 +106,12 @@ export function encodeAttributedBody(text: string): Buffer {
 export function resolveMessageText(
   text: string | null | undefined,
   attributedBody: Uint8Array | Buffer | null | undefined,
-): { text: string; source: "text" | "attributedBody" | "none" } {
+): { text: string; source: "text" | "attributedBody" | "guess" | "none" } {
   if (text !== null && text !== undefined && text.length > 0) {
     return { text, source: "text" };
   }
-  const decoded = decodeAttributedBody(attributedBody);
-  if (decoded) return { text: decoded, source: "attributedBody" };
+  const decoded = decodeAttributedBodyDetailed(attributedBody);
+  if (decoded.text && decoded.guessed) return { text: decoded.text, source: "guess" };
+  if (decoded.text) return { text: decoded.text, source: "attributedBody" };
   return { text: "", source: "none" };
 }

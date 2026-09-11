@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "apple-messages": {
-      "command": "/usr/bin/npx",
-      "args": ["tsx", "/ABS/PATH/TO/apple-messages-mcp/src/index.ts"],
+      "command": "node",
+      "args": ["/ABS/PATH/TO/apple-messages-mcp/dist/index.js"],
       "env": {
         "MESSAGES_DB_MODE": "copy",
         "ENABLE_SEND": "0",
