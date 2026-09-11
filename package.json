@@ -1,6 +1,6 @@
 {
   "name": "apple-messages-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local MCP server that reads (and optionally sends) Apple Messages / iMessage via chat.db",
   "type": "module",
   "main": "dist/index.js",
@@ -16,7 +16,7 @@
     "typecheck": "tsc --noEmit"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22 <23"
   },
   "keywords": [
     "mcp",

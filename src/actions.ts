@@ -13,6 +13,7 @@ import {
   searchMessages,
 } from "./db/queries.ts";
 import { looksLikeHandle } from "./db/handles.ts";
+import { getProcessSidecar } from "./db/sidecar.ts";
 import { sendViaAppleScript } from "./send/applescript.ts";
 import { getStatus } from "./status.ts";
 
@@ -128,6 +129,7 @@ export function actionSearch(
       redact: config.redactPreviews,
       fromDate: args.from_date,
       toDate: args.to_date,
+      sidecar: getProcessSidecar(config.dbPath),
     });
     return {
       chat_id: chatId ?? null,
@@ -140,24 +142,33 @@ export function actionSearch(
   });
 }
 
-export async function actionSend(
-  config: Config,
-  args: { to: string; body: string; confirm?: boolean },
-): Promise<{
+export type SendDryRun = {
+  to: string;
+  chat_id: number;
+  guid: string;
+  body: string;
+};
+
+export type SendAccepted = {
   ok: true;
   via: string;
   to: string;
   chat_id: number;
   guid: string;
   note: string;
-}> {
+};
+
+export async function actionSend(
+  config: Config,
+  args: { to: string; body: string; confirm?: boolean; dry_run?: boolean },
+): Promise<SendDryRun | SendAccepted> {
   if (!config.enableSend) {
     throw new MessagesError(
       "SEND_DISABLED",
       "messages_send is disabled. Set ENABLE_SEND=1 only after you accept that the agent can send real iMessages.",
     );
   }
-  if (args.confirm !== true) {
+  if (args.dry_run !== true && args.confirm !== true) {
     throw new MessagesError(
       "INVALID_ARGS",
       "messages_send requires confirm: true after the user accepted the exact recipient and body.",
@@ -171,8 +182,20 @@ export async function actionSend(
     return findChatByRef(db, config, args.to);
   });
 
+  const resolvedTo =
+    looksLikeHandle(args.to) && !chat.is_group ? args.to : (chat.display_name ?? args.to);
+
+  if (args.dry_run === true) {
+    return {
+      to: resolvedTo,
+      chat_id: chat.chat_id,
+      guid: chat.guid,
+      body: args.body,
+    };
+  }
+
   const sent = await sendViaAppleScript({
-    to: looksLikeHandle(args.to) && !chat.is_group ? args.to : (chat.display_name ?? args.to),
+    to: resolvedTo,
     body: args.body,
     chat,
     config,

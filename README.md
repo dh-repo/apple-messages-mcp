@@ -9,27 +9,27 @@ See [DESIGN.md](./DESIGN.md) for schema notes, the threat model, Phase 2 watcher
 ## Requirements
 
 - macOS with Messages.app (the live `chat.db` path)
-- Node.js 22+
+- Node.js 22 (engines: `>=22 <23`)
 - Full Disk Access for the app that launches this server (Cursor, or Terminal if you test from a shell)
 - Automation permission for Messages only if you turn send on
 
 Linux CI uses a tiny fixture SQLite database. You do not need Messages.app to run `npm test`.
 
-## Install
+## Install (pinned 0.2.0)
+
+This is meant to be cloned, built, and launched as `node /ABS/PATH/dist/index.js` — not `npx`'d unpinned from a random machine. Requires **Node 22**. `bin` is `dist/index.js`.
 
 ```bash
 git clone https://github.com/dh-repo/apple-messages-mcp.git
 cd apple-messages-mcp
+# stay on a commit whose package.json version you intend to run (0.2.0+)
 npm install
 npm test
-```
-
-The server speaks MCP over stdio (leave this to Cursor; do not write logs to stdout):
-
-```bash
 npm run build
 node dist/index.js
 ```
+
+The server speaks MCP over stdio (leave this to Cursor; do not write logs to stdout). The example Cursor config stays `node /ABS/PATH/TO/apple-messages-mcp/dist/index.js`.
 
 Dev: `npx tsx src/index.ts`. Same binary is a local CLI for the smoke checklist and the Phase 2 watcher:
 
@@ -106,8 +106,8 @@ Default is scoped shut. Pick one:
 | `messages_status` | Can we read `chat.db`? FDA missing? Scoped shut or unscoped? Snapshot size/age? |
 | `messages_list_chats` | Recent chats, or only the allowlist if one is set. |
 | `messages_get_thread` | Messages for a `chat_id` / guid / handle (required unless the allowlist is exactly one chat). |
-| `messages_search` | Two-phase substring search (plain `text` LIKE, then a bounded Tahoe decode). Returns `truncated`. |
-| `messages_send` | Registered only when `ENABLE_SEND=1`. Requires `confirm: true`. |
+| `messages_search` | Two-phase substring search (plain `text` LIKE, then a bounded Tahoe decode). Uses a sidecar of `(message_id, decoded_text)` so old blobs stay findable after they leave the scan window. Returns `truncated` when a row has not been decoded. |
+| `messages_send` | Registered only when `ENABLE_SEND=1`. `dry_run: true` returns `{ to, chat_id, guid, body }` and does not call osascript. A real send still requires `confirm: true`. |
 
 IDs in responses are SQLite `ROWID`s: `chat_id`, `message_id`, `handle_id`, `attachment_id`. Handles are phone numbers and emails, not Contacts names.
 
@@ -138,7 +138,7 @@ Pipe that into your own wake script, or set `MESSAGES_WAKE_HOOK` to [examples/wa
 5. `messages_get_thread` with a `chat_id` from a scoped or unscoped list returns recent lines. At least some `text_source` values may be `attributedBody` on current macOS. `text_source: "guess"` means the decoder fell back to printable bytes.
 6. `messages_search` with a word you know exists returns hits across chats, or empty + `truncated: true` when the Tahoe window missed.
 7. `messages_send` is absent from `tools/list` while `ENABLE_SEND` is unset.
-8. Optional: `ENABLE_SEND=1`, Automation allowed, send a one-line test, confirm it in Messages.app. Leave send off afterward.
+8. Optional: `ENABLE_SEND=1`, Automation allowed. `dry_run: true` returns `{ to, chat_id, guid, body }` without sending. A real send still needs `confirm: true`. Leave send off afterward.
 9. `npx tsx src/index.ts status` (CLI) matches the MCP `messages_status` payload.
 10. `npx tsx src/index.ts watch --interval 2000` prints one `messages.ready` line and, on a new message, `messages.new` without plaintext.
 

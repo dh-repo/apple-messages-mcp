@@ -6,6 +6,13 @@ import { looksLikeHandle } from "../db/handles.ts";
 
 const execFileAsync = promisify(execFile);
 
+/** Test hook: real send path only. dry_run must not increment this. */
+export let sendViaAppleScriptCalls = 0;
+
+export function resetSendViaAppleScriptCalls(): void {
+  sendViaAppleScriptCalls = 0;
+}
+
 function escapeForDisplay(value: string): string {
   return value.length > 80 ? `${value.slice(0, 80)}…` : value;
 }
@@ -20,6 +27,7 @@ export async function sendViaAppleScript(opts: {
   chat: ChatSummary;
   config: Config;
 }): Promise<{ ok: true; via: string; to: string }> {
+  sendViaAppleScriptCalls += 1;
   if (!opts.config.enableSend) {
     throw new MessagesError(
       "SEND_DISABLED",

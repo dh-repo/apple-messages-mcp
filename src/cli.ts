@@ -37,7 +37,7 @@ function usage(): string {
   list [--query TEXT]    messages_list_chats
   thread [--chat-id N] [--handle ADDR] [--limit N] [--before ID|ISO]
   search QUERY
-  send --to NAME --body TEXT --confirm   (needs ENABLE_SEND=1)
+  send --to NAME --body TEXT --confirm [--dry-run]   (needs ENABLE_SEND=1)
   watch [--interval MS]  Phase 2 JSON-line wake hook (not MCP)
 
 Env: MESSAGES_DB_PATH, ENABLE_SEND, REDACT_PREVIEWS,
@@ -126,7 +126,12 @@ export async function runCli(argv: string[]): Promise<void> {
           throw new MessagesError("INVALID_ARGS", "send requires --to and --body.");
         }
         printJson(
-          await actionSend(config, { to, body, confirm: argv.includes("--confirm") }),
+          await actionSend(config, {
+            to,
+            body,
+            confirm: argv.includes("--confirm"),
+            dry_run: argv.includes("--dry-run"),
+          }),
         );
         return;
       }

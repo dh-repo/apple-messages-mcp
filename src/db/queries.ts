@@ -15,6 +15,8 @@ import { MessagesError } from "../types.ts";
 import { appleDateToIso, isoToAppleNanos, isIsoDate } from "./dates.ts";
 import { handlesMatch, looksLikeHandle } from "./handles.ts";
 import { listTables, tableColumns } from "./open.ts";
+import type { DecodeSidecar } from "./sidecar.ts";
+import { syncSidecarWithLiveMax } from "./sidecar.ts";
 
 const DEFAULT_CHAT_LIMIT = 30;
 const MAX_CHAT_LIMIT = 100;
@@ -809,6 +811,52 @@ export function findChatByRef(
   return getChatById(db, allowed[0]!.chat_id, config.redactPreviews) ?? allowed[0]!;
 }
 
+function hasUndecodedEmptyText(
+  db: DatabaseSync,
+  baseClauses: string[],
+  baseParams: Array<string | number>,
+  knownIds: number[],
+): boolean {
+  const empty = "(m.text IS NULL OR trim(m.text) = '')";
+  const rows = db
+    .prepare(
+      `SELECT m.ROWID AS message_id
+       FROM message m
+       JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+       WHERE ${baseClauses.join(" AND ")} AND ${empty}`,
+    )
+    .all(...baseParams) as Array<Record<string, unknown>>;
+  if (knownIds.length === 0) return rows.length > 0;
+  const known = new Set(knownIds);
+  return rows.some((row) => {
+    const id = asNumber(row.message_id);
+    return id !== null && !known.has(id);
+  });
+}
+
+function loadMessagesByIds(
+  db: DatabaseSync,
+  select: string,
+  baseClauses: string[],
+  baseParams: Array<string | number>,
+  ids: number[],
+  redact: boolean,
+): MessageRow[] {
+  if (ids.length === 0) return [];
+  const placeholders = ids.map(() => "?").join(", ");
+  const rows = db
+    .prepare(
+      `${select}
+       WHERE ${baseClauses.join(" AND ")}
+         AND m.ROWID IN (${placeholders})`,
+    )
+    .all(...baseParams, ...ids) as Array<Record<string, unknown>>;
+  return rows.map((row) => {
+    const mapped = mapMessage(db, row, false);
+    return { ...mapped, text: maybeRedact(mapped.text, redact) };
+  });
+}
+
 export function searchMessages(
   db: DatabaseSync,
   opts: {
@@ -819,11 +867,17 @@ export function searchMessages(
     redact: boolean;
     fromDate?: string;
     toDate?: string;
+    sidecar?: DecodeSidecar;
   },
 ): SearchResult {
   const query = opts.query.trim();
   if (!query) {
     throw new MessagesError("INVALID_ARGS", "query must be a non-empty string.");
+  }
+
+  const sidecar = opts.sidecar;
+  if (sidecar) {
+    syncSidecarWithLiveMax(db, sidecar);
   }
 
   const messageCols = tableColumns(db, "message");
@@ -879,8 +933,30 @@ export function searchMessages(
   for (const row of tahoeRows) {
     scanned += 1;
     const mapped = mapMessage(db, row, false);
+    if (sidecar) {
+      sidecar.put(mapped.message_id, mapped.text);
+    }
     if (mapped.text.toLowerCase().includes(needle) && !byId.has(mapped.message_id)) {
       byId.set(mapped.message_id, { ...mapped, text: maybeRedact(mapped.text, opts.redact) });
+    }
+  }
+
+  if (sidecar) {
+    const extraIds = sidecar
+      .search(needle)
+      .map((hit) => hit.message_id)
+      .filter((id) => !byId.has(id));
+    for (const mapped of loadMessagesByIds(
+      db,
+      select,
+      baseClauses,
+      baseParams,
+      extraIds,
+      opts.redact,
+    )) {
+      if (!byId.has(mapped.message_id)) {
+        byId.set(mapped.message_id, mapped);
+      }
     }
   }
 
@@ -893,9 +969,13 @@ export function searchMessages(
     })
     .slice(0, limit);
 
+  const truncated = sidecar
+    ? hasUndecodedEmptyText(db, baseClauses, baseParams, sidecar.messageIds())
+    : tahoeRows.length >= window;
+
   return {
     messages,
-    truncated: tahoeRows.length >= window,
+    truncated,
     scanned,
   };
 }

@@ -148,9 +148,9 @@ export function registerTools(server: McpServer, config: Config): void {
     {
       title: "Search messages",
       description:
-        `Search message text: SQL LIKE on the plain text column, then a bounded decode-scan of empty-text / Tahoe rows.` +
+        `Search message text: SQL LIKE on the plain text column, then a bounded decode-scan of empty-text / Tahoe rows. Decoded Tahoe bodies live in a sidecar file we own (message_id, decoded_text), so they stay findable after leaving the scan window.` +
         scopeHint +
-        " Returns truncated:true and scanned when the Tahoe window is exhausted. With no chat_id, searches across all readable chats (or the allowlist). Case-insensitive. Does not search attachment binaries. Does not write FTS into chat.db.",
+        " Returns truncated:true when an in-scope empty-text row has not been decoded yet. With no chat_id, searches across all readable chats (or the allowlist). Case-insensitive. Does not search attachment binaries. Does not write into chat.db. Does not FTS attributedBody.",
       inputSchema: z.object({
         query: z.string().min(1).describe("Substring to find."),
         limit: z.number().int().min(1).max(100).optional().describe("Default 25."),
@@ -188,9 +188,9 @@ export function registerTools(server: McpServer, config: Config): void {
     {
       title: "Send message",
       description:
-        "Sends a real iMessage/SMS through Messages.app via AppleScript. Requires confirm: true after the user accepted the exact recipient and body. `to` is resolved in-process to one in-scope chat (guid, handle, chat_id, or display name), then passed to osascript as argv." +
+        "Sends a real iMessage/SMS through Messages.app via AppleScript. dry_run: true returns { to, chat_id, guid, body } and does not call osascript. An actual send still requires confirm: true after the user accepted the exact recipient and body. `to` is resolved in-process to one in-scope chat (guid, handle, chat_id, or display name), then passed to osascript as argv." +
         (scoped ? " An allowlist is active; `to` must identify one of those chats." : "") +
-        " Requires Automation permission for the launching app. This is not a preview — it sends.",
+        " Requires Automation permission for the launching app.",
       inputSchema: z.object({
         to: z
           .string()
@@ -200,13 +200,21 @@ export function registerTools(server: McpServer, config: Config): void {
         confirm: z
           .boolean()
           .optional()
-          .describe("Must be true. Tool text is not a control; this flag is."),
+          .describe("Required to actually send. Not required for dry_run."),
+        dry_run: z
+          .boolean()
+          .optional()
+          .describe("If true, resolve the target and return { to, chat_id, guid, body } without sending."),
       }),
     },
-    async ({ to, body, confirm }) => {
+    async ({ to, body, confirm, dry_run }) => {
       try {
-        const sent = await actionSend(config, { to, body, confirm });
-        logInfo("messages_send", { chat_id: sent.chat_id, guid: sent.guid, via: sent.via });
+        const sent = await actionSend(config, { to, body, confirm, dry_run });
+        if ("via" in sent) {
+          logInfo("messages_send", { chat_id: sent.chat_id, guid: sent.guid, via: sent.via });
+        } else {
+          logInfo("messages_send_dry_run", { chat_id: sent.chat_id, guid: sent.guid });
+        }
         return jsonResult(sent);
       } catch (err) {
         return errorResult(err);

@@ -4,7 +4,7 @@ import { isScopeActive, loadConfig } from "./config.ts";
 import { registerTools } from "./tools.ts";
 
 export const SERVER_NAME = "apple-messages";
-export const SERVER_VERSION = "0.1.0";
+export const SERVER_VERSION = "0.2.0";
 
 export function createServer(config: Config = loadConfig()): McpServer {
   const server = new McpServer({
